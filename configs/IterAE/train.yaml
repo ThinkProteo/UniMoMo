@@ -88,7 +88,7 @@ trainer:
     warmup: 2000 # gradually increasing KL divergence for training stability (8 A800 GPUs)
     metric_min_better: true
     proj_name: UniMoMo # for wandb
-    logger: tensorboard # if you want to use wandb, please comment this line 
+    #logger: tensorboard # if you want to use wandb, please comment this line 
 
     optimizer:
       class: AdamW
@@ -108,7 +108,7 @@ model:
   decoder_type: EPT
   embed_size: 512
   hidden_size: 512
-  latent_size: 8
+  latent_size: 128
   edge_size: 64
   k_neighbors: 9
   encoder_opt:

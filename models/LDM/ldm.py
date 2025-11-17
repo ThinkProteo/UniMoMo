@@ -4,6 +4,10 @@ import torch
 import torch.nn as nn
 from torch_scatter import scatter_mean
 
+# Disable TF32 to avoid CUBLAS errors on H100/H200 GPUs
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
 from data.bioparse import VOCAB
 
 import utils.register as R

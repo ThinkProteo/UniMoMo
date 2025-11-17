@@ -3,7 +3,6 @@
 
 from .EPT.ept import XTransEncoderAct as EPT
 
-
 def create_net(
     name,
     hidden_size,

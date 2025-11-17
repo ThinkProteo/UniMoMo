@@ -22,6 +22,8 @@ from utils.logger import print_log
 from utils.random_seed import setup_seed
 from models.LDM.data_utils import Recorder, OverwriteTask, _get_item
 
+from utils import register as R
+
 
 def get_best_ckpt(ckpt_dir):
     with open(os.path.join(ckpt_dir, 'checkpoint', 'topk_map.txt'), 'r') as f:
@@ -134,18 +136,59 @@ def main(args, opt_args):
     config = overwrite_values(config, opt_args)
     mode = config.get('sample_opt', {}).get('mode', 'codesign')
     struct_only = mode == 'fixseq'
+
     # load model
     b_ckpt = args.ckpt if args.ckpt.endswith('.ckpt') else get_best_ckpt(args.ckpt)
     ckpt_dir = os.path.split(os.path.split(b_ckpt)[0])[0]
     print(f'Using checkpoint {b_ckpt}')
-    model = torch.load(b_ckpt, map_location='cpu')
+
+    checkpoint = torch.load(b_ckpt, map_location='cpu')
+
+    # --- Handle different checkpoint formats ---
+    def _strip_module_prefix(state):
+        """Remove 'module.' prefix from state dict keys (from DDP training)"""
+        if any(k.startswith("module.") for k in state.keys()):
+            state = {k.replace("module.", "", 1): v for k, v in state.items()}
+        return state
+
+    # Build model from config
+    model = R.construct(config['model'])
+    
+    # Extract state dict from checkpoint
+    if isinstance(checkpoint, dict):
+        # New format: checkpoint with training state (model_state_dict, optimizer_state_dict, etc.)
+        if "model_state_dict" in checkpoint:
+            state = checkpoint["model_state_dict"]
+            print(f"Loading from training checkpoint (epoch {checkpoint.get('epoch', 'unknown')})")
+        # Alternative format: just state_dict key
+        elif "state_dict" in checkpoint:
+            state = checkpoint["state_dict"]
+        # Old format: checkpoint IS the state dict
+        else:
+            state = checkpoint
+    elif hasattr(checkpoint, "state_dict"):
+        # Checkpoint is an nn.Module
+        state = checkpoint.state_dict()
+    else:
+        raise ValueError(f"Unknown checkpoint format: {type(checkpoint)}")
+    
+    # Strip module prefix and load
+    state = _strip_module_prefix(state)
+    incompatible = model.load_state_dict(state, strict=False)
+    
+    if incompatible.missing_keys:
+        print(f"Warning: Missing keys in checkpoint: {incompatible.missing_keys}")
+    if incompatible.unexpected_keys:
+        print(f"Warning: Unexpected keys in checkpoint: {incompatible.unexpected_keys}")
+    # --- end checkpoint loading ---
+
     device = torch.device('cpu' if args.gpu == -1 else f'cuda:{args.gpu}')
     model.to(device)
     model.eval()
 
     # load data
     _, _, test_set = create_dataset(config['dataset'])
-    
+
     # save path
     if args.save_dir is None:
         save_dir = os.path.join(ckpt_dir, 'results')
@@ -157,11 +200,9 @@ def main(args, opt_args):
     for directory in [ref_save_dir, cand_save_dir, tmp_cand_save_dir]:
         if not os.path.exists(directory):
             os.makedirs(directory)
-    
 
     n_samples = config.get('n_samples', 1)
     n_cycles = config.get('n_cycles', 0)
-
     recorder = Recorder(test_set, n_samples, save_dir)
     
     batch_size = config['dataloader']['batch_size']

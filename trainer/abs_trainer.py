@@ -179,7 +179,20 @@ class Trainer:
         if self._is_main_proc():
             save_path = os.path.join(self.model_dir, f'epoch{self.epoch}_step{self.global_step}.ckpt')
             module_to_save = self.model.module if self.local_rank == 0 else self.model
-            torch.save(module_to_save, save_path)
+            
+            # Save full training state
+            checkpoint = {
+                'model_state_dict': module_to_save.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None,
+                'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+                'epoch': self.epoch,
+                'global_step': self.global_step,
+                # 'best_metric': self.best_metric,
+                'patience': self.patience,
+                'config': self.config.__dict__ if hasattr(self.config, '__dict__') else dict(self.config),
+            }
+            
+            torch.save(checkpoint, save_path)
             self._maintain_topk_checkpoint(valid_metric, save_path)
             print_log(f'Validation: {valid_metric}, save path: {save_path}')
         if self._metric_better(valid_metric):

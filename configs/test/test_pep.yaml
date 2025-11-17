@@ -9,3 +9,26 @@ dataloader:
 
 n_samples: 100
 n_cycles: 0
+
+model:
+  class: LDMMolDesign
+  autoencoder_ckpt: './ckpts/unimomo/latdim32_AE_unimomo/version_0/checkpoint/epoch229_step219420.ckpt' # load by yourself
+  latent_deterministic: true  # without resample in training
+  hidden_size: 512
+  num_steps: 100
+  h_loss_weight: 1.0
+  std: 10.0
+  diffusion_opt:
+    trans_seq_type: Diffusion
+    trans_pos_type: Diffusion
+    encoder_type: EPT
+    encoder_opt:
+      n_layers: 6
+      n_rbf: 64
+      cutoff: 3.0  # already normalized
+      n_head: 8
+      use_edge_feat: true
+      pre_norm: true
+      efficient: false
+      vector_act: layernorm
+  is_aa_corrupt_ratio: 0.1

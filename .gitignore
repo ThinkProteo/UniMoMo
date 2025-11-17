@@ -15,3 +15,13 @@ demo
 datasets
 
 checkpoints
+
+DETAILED_FIX_EXPLANATION.md
+FIXES_H200_COMPATIBILITY.md
+GPG-PUB-KEY-INTEL-SW-PRODUCTS-2023.PUB
+configs/LDM/train.yaml_orig
+configs/LDM/train_antibody.yaml
+models/modules/__init__.py
+results/
+
+

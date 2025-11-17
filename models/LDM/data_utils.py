@@ -235,7 +235,7 @@ class Recorder:
         self.pbar = tqdm(total=n_samples * len(test_set))
         self.waiting_list = [(i, n) for n in range(n_samples) for i in range(len(test_set))]
         self.num_generated, self.num_failed = 0, 0
-        self.fout = open(os.path.join(save_dir, 'results.jsonl'), 'w')
+        self.fout = open(os.path.join(save_dir, 'results_dim32.jsonl'), 'w')
 
     def is_finished(self):
         return len(self.waiting_list) == 0

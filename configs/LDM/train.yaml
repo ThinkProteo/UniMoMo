@@ -22,27 +22,7 @@ dataset:
             length_type: block
         # weights: [1.0, 1.0, 1.0]
       complexity: n*n
-      ubound_per_batch: 1800000
-      n_use_max_in_batch: true
-    # Small Molecules
-    - class: DynamicBatchWrapper
-      dataset: # crossdocked
-        class: MoleculeDataset
-        mmap_dir: ./datasets/molecule/CrossDocked/processed
-        specify_index: ./datasets/molecule/CrossDocked/processed/train_index.txt
-        length_type: block
-      complexity: n*n
-      ubound_per_batch: 800000
-      n_use_max_in_batch: true
-    # Antibody
-    - class: DynamicBatchWrapper
-      dataset:
-        class: AntibodyDataset
-        mmap_dir: ./datasets/antibody/SAbDab/processed
-        specify_index: ./datasets/antibody/SAbDab/processed/train_index.txt
-        length_type: block
-      complexity: n*n
-      ubound_per_batch: 900000
+      ubound_per_batch: 3600000  # Increased from 1800000 (2x for better GPU utilization)
       n_use_max_in_batch: true
   valid:
     - class: DynamicBatchWrapper
@@ -52,25 +32,7 @@ dataset:
         specify_index: ./datasets/peptide/pepbench/processed/valid_index.txt
         length_type: block
       complexity: n*n
-      ubound_per_batch: 1800000
-      n_use_max_in_batch: true
-    - class: DynamicBatchWrapper
-      dataset: 
-        class: MoleculeDataset
-        mmap_dir: ./datasets/molecule/CrossDocked/processed
-        specify_index: ./datasets/molecule/CrossDocked/processed/valid_index.txt
-        length_type: block
-      complexity: n*n
-      ubound_per_batch: 600000 # avoid autoencoder OOM in validation
-      n_use_max_in_batch: true
-    - class: DynamicBatchWrapper
-      dataset: 
-        class: AntibodyDataset
-        mmap_dir: ./datasets/antibody/SAbDab/processed
-        specify_index: ./datasets/antibody/SAbDab/processed/valid_index.txt
-        length_type: block
-      complexity: n*n
-      ubound_per_batch: 900000
+      ubound_per_batch: 2400000  # Increased from 1800000 for faster validation
       n_use_max_in_batch: true
 
 dataloader:
@@ -84,7 +46,7 @@ trainer:
   class: LDMTrainer
   criterion: loss
   config:
-    max_epoch: 500
+    max_epoch: 1000
     save_topk: 10
     val_freq: 1
     save_dir: ./ckpts/unimomo
@@ -107,7 +69,7 @@ trainer:
 
 model:
   class: LDMMolDesign
-  autoencoder_ckpt: '' # load by yourself
+  autoencoder_ckpt: './ckpts/unimomo/latdim32_AE_unimomo/version_0/checkpoint/epoch229_step219420.ckpt' # load by yourself
   latent_deterministic: true  # without resample in training
   hidden_size: 512
   num_steps: 100
