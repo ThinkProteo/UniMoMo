@@ -37,7 +37,9 @@ class LDMMolDesign(nn.Module):
         super().__init__()
         self.latent_deterministic = latent_deterministic
 
-        self.autoencoder: CondIterAutoEncoder = torch.load(autoencoder_ckpt, map_location='cpu')
+        self.autoencoder: CondIterAutoEncoder = torch.load(
+            autoencoder_ckpt, map_location='cpu', weights_only=False
+        )
         for param in self.autoencoder.parameters():
             param.requires_grad = False
         self.autoencoder.eval()
