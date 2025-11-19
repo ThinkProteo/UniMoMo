@@ -120,7 +120,8 @@ class FullDPM(nn.Module):
         edges = torch.cat([ctx_edges, inter_edges], dim=-1)
         edge_types = torch.cat([torch.zeros_like(ctx_edges[0]), torch.ones_like(inter_edges[0])], dim=0)
         return edges, edge_types
-    
+
+
     def forward(
             self,
             H_0,                # [Nblock, latent size]
@@ -129,36 +130,96 @@ class FullDPM(nn.Module):
             chain_ids,          # [Nblock]
             generate_mask,      # [Nblock]
             lengths,            # [batch size]
-            t=None
+            t=None,
+            ispred_x=True      # Use True to enable the x-pred / v-loss mode
         ):
         # if L is not None:
         #     L = L / self.std
-        batch_ids = length_to_batch_id(lengths)
-        batch_size = batch_ids.max() + 1
-        if t == None: # sample time step
-            t = torch.randint(0, self.num_steps + 1, (batch_size,), dtype=torch.long, device=H_0.device)
 
-        X_noisy, eps_X = self.trans_x.add_noise(X_0, generate_mask, batch_ids, t)
-        H_noisy, eps_H = self.trans_h.add_noise(H_0, generate_mask, batch_ids, t)
+        if ispred_x:
+            # --- x-pred mode with v-loss (Back to Basics / JiT style) ---
+            batch_ids = length_to_batch_id(lengths)
+            batch_size = batch_ids.max() + 1
+            if t is None: 
+                t = torch.randint(0, self.num_steps + 1, (batch_size,), dtype=torch.long, device=H_0.device)
 
-        edges, edge_types = self._get_edges(chain_ids, batch_ids, lengths)
+            # 1. Add noise
+            X_noisy, eps_X = self.trans_x.add_noise(X_0, generate_mask, batch_ids, t)
+            H_noisy, eps_H = self.trans_h.add_noise(H_0, generate_mask, batch_ids, t)
 
-        beta = self.trans_x.get_timestamp(t)[batch_ids]  # [N]
-        eps_H_pred, eps_X_pred = self.eps_net(
-            H_noisy, X_noisy, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta
-        )
+            edges, edge_types = self._get_edges(chain_ids, batch_ids, lengths)
+            beta = self.trans_x.get_timestamp(t)[batch_ids]
 
-        loss_dict = {}
+            # 2. Run Network to predict residuals
+            # EpsilonNet outputs: model_out = x_pred - noisy
+            model_out_H, model_out_X = self.eps_net(
+                H_noisy, X_noisy, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta
+            )
+            
+            # 3. Reconstruct x_0 (prediction)
+            X_0_pred = X_noisy + model_out_X
+            H_0_pred = H_noisy + model_out_H
 
-        # equivariant vector feature loss
-        loss_X = F.mse_loss(eps_X_pred[generate_mask], eps_X[generate_mask], reduction='none').sum(dim=-1)  # (Ntgt * n_latent_channel)
-        loss_X = loss_X.sum() / (generate_mask.sum().float() + 1e-8)
-        loss_dict['X'] = loss_X
+            # 4. Compute v-loss
+            # We compute velocity v in DDPM space derived from x_0 and z_t.
+            # Formula: v = (sqrt(alpha_bar) * z_t - x_0) / sqrt(1 - alpha_bar)
+            
+            def compute_v_loss(trans_obj, noisy_val, x0_pred, x0_true, t_steps, b_ids, mask):
+                # Access alpha_bars
+                alpha_bar = trans_obj.var_sched.alpha_bars[t_steps] # [Batch]
+                alpha_bar = alpha_bar[b_ids].unsqueeze(-1)          # [Nodes, 1]
 
-        # invariant scalar feature loss
-        loss_H = F.mse_loss(eps_H_pred[generate_mask], eps_H[generate_mask], reduction='none').sum(dim=-1)  # [N]
-        loss_H = loss_H.sum() / (generate_mask.sum().float() + 1e-8)
-        loss_dict['H'] = loss_H
+                c0 = torch.sqrt(alpha_bar)
+                c1 = torch.sqrt(1.0 - alpha_bar)
+                
+                # Clip denominator for stability (as per PDF Algorithm 1, typically 0.05 equivalent)
+                c1_clipped = c1.clamp(min=0.05)
+
+                # Target v (computed from ground truth x0)
+                v_target = (c0 * noisy_val - x0_true) / c1_clipped
+                
+                # Predicted v (computed from predicted x0)
+                v_pred = (c0 * noisy_val - x0_pred) / c1_clipped
+                
+                # MSE Loss on v
+                loss = F.mse_loss(v_pred[mask], v_target[mask], reduction='none').sum(dim=-1)
+                return loss
+
+            loss_X_per_node = compute_v_loss(self.trans_x, X_noisy, X_0_pred, X_0, t, batch_ids, generate_mask)
+            loss_H_per_node = compute_v_loss(self.trans_h, H_noisy, H_0_pred, H_0, t, batch_ids, generate_mask)
+
+            loss_dict = {}
+            loss_dict['X'] = loss_X_per_node.sum() / (generate_mask.sum().float() + 1e-8)
+            loss_dict['H'] = loss_H_per_node.sum() / (generate_mask.sum().float() + 1e-8)
+
+        else:
+            # --- Standard Epsilon Pred ---
+            batch_ids = length_to_batch_id(lengths)
+            batch_size = batch_ids.max() + 1
+            if t == None: # sample time step
+                t = torch.randint(0, self.num_steps + 1, (batch_size,), dtype=torch.long, device=H_0.device)
+
+            X_noisy, eps_X = self.trans_x.add_noise(X_0, generate_mask, batch_ids, t)
+            H_noisy, eps_H = self.trans_h.add_noise(H_0, generate_mask, batch_ids, t)
+
+            edges, edge_types = self._get_edges(chain_ids, batch_ids, lengths)
+
+            beta = self.trans_x.get_timestamp(t)[batch_ids]  # [N]
+            eps_H_pred, eps_X_pred = self.eps_net(
+                H_noisy, X_noisy, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta
+            )
+
+            loss_dict = {}
+
+            # equivariant vector feature loss
+            loss_X = F.mse_loss(eps_X_pred[generate_mask], eps_X[generate_mask], reduction='none').sum(dim=-1)  # (Ntgt * n_latent_channel)
+            loss_X = loss_X.sum() / (generate_mask.sum().float() + 1e-8)
+            loss_dict['X'] = loss_X
+
+            # invariant scalar feature loss
+            loss_H = F.mse_loss(eps_H_pred[generate_mask], eps_H[generate_mask], reduction='none').sum(dim=-1)  # [N]
+            loss_H = loss_H.sum() / (generate_mask.sum().float() + 1e-8)
+            loss_dict['H'] = loss_H
 
         return loss_dict
 
@@ -210,6 +271,10 @@ class FullDPM(nn.Module):
                 H_t, X_t, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta
             )
 
+            # Note: Ensure the sampler is compatible with the prediction mode used during training.
+            # Standard DDPM denoise expects epsilon. If model predicts x, conversion is needed here too.
+            # Assuming epsilon-pred mode for standard sampling in this snippet.
+            
             H_next = self.trans_h.denoise(H_t, eps_H, generate_mask, batch_ids, t_tensor)
             # X_next = self.trans_x.denoise(X_t, eps_X, generate_mask, batch_ids, t_tensor, guidance=energy_eps_X, guidance_weight=energy_lambda)
             X_next = self.trans_x.denoise(X_t, eps_X, generate_mask, batch_ids, t_tensor)
