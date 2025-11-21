@@ -68,6 +68,7 @@ def generate_wrapper(model, sample_opt={}):
             return batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds
     elif isinstance(model, models.LDMMolDesign):# or isinstance(model, models.LFMMolDesign):
         def wrapper(batch):
+            # Pass sample_opt (which now contains ispred_x) to the model
             res_tuple = model.sample(sample_opt=sample_opt, **batch)
             if len(res_tuple) == 6:
                 batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = res_tuple
@@ -137,6 +138,14 @@ def main(args, opt_args):
     mode = config.get('sample_opt', {}).get('mode', 'codesign')
     struct_only = mode == 'fixseq'
 
+    # --- INJECT ispred_x into config if argument is set ---
+    if args.ispred_x:
+        if 'sample_opt' not in config:
+            config['sample_opt'] = {}
+        config['sample_opt']['ispred_x'] = True
+        print(f"LOG: Enabled x-prediction sampling mode via command line.")
+    # ------------------------------------------------------
+
     # load model
     b_ckpt = args.ckpt if args.ckpt.endswith('.ckpt') else get_best_ckpt(args.ckpt)
     ckpt_dir = os.path.split(os.path.split(b_ckpt)[0])[0]
@@ -156,18 +165,14 @@ def main(args, opt_args):
     
     # Extract state dict from checkpoint
     if isinstance(checkpoint, dict):
-        # New format: checkpoint with training state (model_state_dict, optimizer_state_dict, etc.)
         if "model_state_dict" in checkpoint:
             state = checkpoint["model_state_dict"]
             print(f"Loading from training checkpoint (epoch {checkpoint.get('epoch', 'unknown')})")
-        # Alternative format: just state_dict key
         elif "state_dict" in checkpoint:
             state = checkpoint["state_dict"]
-        # Old format: checkpoint IS the state dict
         else:
             state = checkpoint
     elif hasattr(checkpoint, "state_dict"):
-        # Checkpoint is an nn.Module
         state = checkpoint.state_dict()
     else:
         raise ValueError(f"Unknown checkpoint format: {type(checkpoint)}")
@@ -251,6 +256,7 @@ def main(args, opt_args):
             model_autoencoder = getattr(model, 'autoencoder', model)
             with torch.no_grad():
                 if final_cycle: batch['topo_generate_mask'] = torch.zeros_like(batch['generate_mask'])
+                # Ensure x-pred flag is also passed to autoencoder wrapper if needed
                 batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = generate_wrapper(model_autoencoder, deepcopy(config.get('sample_opt', {})))(batch)
             for S, X, A, ll, bonds, intra_bonds, (item_idx, n) in zip(batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds, batch_list):
                 cplx: Complex = deepcopy(test_set.get_raw_data(item_idx))
@@ -284,9 +290,11 @@ def parse():
     parser.add_argument('--config', type=str, required=True, help='Path to the test configuration')
     parser.add_argument('--ckpt', type=str, required=True, help='Path to checkpoint')
     parser.add_argument('--save_dir', type=str, default=None, help='Directory to save generated peptides')
-
     parser.add_argument('--gpu', type=int, default=0, help='GPU to use, -1 for cpu')
     parser.add_argument('--n_cpu', type=int, default=4, help='Number of CPU to use (for parallelly saving the generated results)')
+    # --- NEW ARGUMENT ---
+    parser.add_argument('--ispred_x', action='store_true', help='Enable x-prediction sampling mode (must match training)')
+    # --------------------
     return parser.parse_known_args()
 
 

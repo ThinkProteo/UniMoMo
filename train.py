@@ -28,6 +28,10 @@ def parse():
     # ADDED: Resume from checkpoint
     parser.add_argument('--resume_from_checkpoint', type=str, default='', 
                         help='Path to checkpoint to resume training from')
+
+    # ADDED: x-prediction mode flag
+    parser.add_argument('--ispred_x', action='store_true', 
+                        help='Enable x-prediction mode (predict clean data) instead of epsilon-prediction')
     
     return parser.parse_known_args()
 
@@ -36,6 +40,13 @@ def main(args, opt_args):
     config = yaml.safe_load(open(args.config, 'r'))
     config = overwrite_values(config, opt_args)
     
+    # ADDED: Inject ispred_x into model config if specified
+    if args.ispred_x:
+        if 'diffusion_opt' not in config['model']:
+            config['model']['diffusion_opt'] = {}
+        config['model']['diffusion_opt']['ispred_x'] = True
+        print_log('Command line override: Enabled x-prediction mode (ispred_x=True)')
+
     # ADDED: Store resume checkpoint path in config
     resume_checkpoint = args.resume_from_checkpoint or config.get('resume_from_checkpoint', '')
     

@@ -97,12 +97,14 @@ class FullDPM(nn.Module):
         trans_pos_opt={}, 
         trans_seq_opt={},
         encoder_opt={},
+        ispred_x=False  # <--- Added to fix TypeError
     ):
         super().__init__()
         self.eps_net = EpsilonNet(latent_size, hidden_size, encoder_type, encoder_opt)
         self.num_steps = num_steps
         self.trans_x = construct_transition(trans_pos_type, num_steps, trans_pos_opt)
         self.trans_h = construct_transition(trans_seq_type, num_steps, trans_seq_opt)
+        self.ispred_x = ispred_x  # Store the config
 
     @torch.no_grad()
     def _get_edges(self, chain_ids, batch_ids, lengths):
@@ -121,105 +123,84 @@ class FullDPM(nn.Module):
         edge_types = torch.cat([torch.zeros_like(ctx_edges[0]), torch.ones_like(inter_edges[0])], dim=0)
         return edges, edge_types
 
+    def _get_eps_from_x0(self, trans_obj, noisy_val, x0_pred, t_steps, b_ids):
+        """Helper to convert predicted x0 back to epsilon for the loss/sampler."""
+        alpha_bar = trans_obj.var_sched.alpha_bars[t_steps] # [Batch]
+        alpha_bar = alpha_bar[b_ids].unsqueeze(-1)          # [Nodes, 1]
+
+        sqrt_alpha_bar = torch.sqrt(alpha_bar)
+        sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar)
+        
+        denom = sqrt_one_minus_alpha_bar.clamp(min=1e-8)
+        
+        eps_derived = (noisy_val - sqrt_alpha_bar * x0_pred) / denom
+        return eps_derived
 
     def forward(
             self,
             H_0,                # [Nblock, latent size]
             X_0,                # [Nblock, 3]
-            cond_embedding,     # [Nblock, hidden size], conditional embedding
+            cond_embedding,     # [Nblock, hidden size]
             chain_ids,          # [Nblock]
             generate_mask,      # [Nblock]
             lengths,            # [batch size]
             t=None,
-            ispred_x=True      # Use True to enable the x-pred / v-loss mode
+            ispred_x=None       # Defaults to None to use self.ispred_x
         ):
-        # if L is not None:
-        #     L = L / self.std
+        
+        # Use instance configuration if not overridden
+        if ispred_x is None:
+            ispred_x = self.ispred_x
+
+        batch_ids = length_to_batch_id(lengths)
+        batch_size = batch_ids.max() + 1
+        
+        if t is None: 
+            t = torch.randint(0, self.num_steps + 1, (batch_size,), dtype=torch.long, device=H_0.device)
+
+        # 1. Add Noise
+        X_noisy, eps_X = self.trans_x.add_noise(X_0, generate_mask, batch_ids, t)
+        H_noisy, eps_H = self.trans_h.add_noise(H_0, generate_mask, batch_ids, t)
+
+        edges, edge_types = self._get_edges(chain_ids, batch_ids, lengths)
+        beta = self.trans_x.get_timestamp(t)[batch_ids]
+
+        # 2. Predict
+        model_out_H, model_out_X = self.eps_net(
+            H_noisy, X_noisy, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta
+        )
+
+        loss_dict = {}
 
         if ispred_x:
-            # --- x-pred mode with v-loss (Back to Basics / JiT style) ---
-            batch_ids = length_to_batch_id(lengths)
-            batch_size = batch_ids.max() + 1
-            if t is None: 
-                t = torch.randint(0, self.num_steps + 1, (batch_size,), dtype=torch.long, device=H_0.device)
-
-            # 1. Add noise
-            X_noisy, eps_X = self.trans_x.add_noise(X_0, generate_mask, batch_ids, t)
-            H_noisy, eps_H = self.trans_h.add_noise(H_0, generate_mask, batch_ids, t)
-
-            edges, edge_types = self._get_edges(chain_ids, batch_ids, lengths)
-            beta = self.trans_x.get_timestamp(t)[batch_ids]
-
-            # 2. Run Network to predict residuals
-            # EpsilonNet outputs: model_out = x_pred - noisy
-            model_out_H, model_out_X = self.eps_net(
-                H_noisy, X_noisy, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta
-            )
-            
-            # 3. Reconstruct x_0 (prediction)
+            # --- x-pred mode with v-loss ---
             X_0_pred = X_noisy + model_out_X
             H_0_pred = H_noisy + model_out_H
 
-            # 4. Compute v-loss
-            # We compute velocity v in DDPM space derived from x_0 and z_t.
-            # Formula: v = (sqrt(alpha_bar) * z_t - x_0) / sqrt(1 - alpha_bar)
-            
-            def compute_v_loss(trans_obj, noisy_val, x0_pred, x0_true, t_steps, b_ids, mask):
-                # Access alpha_bars
-                alpha_bar = trans_obj.var_sched.alpha_bars[t_steps] # [Batch]
-                alpha_bar = alpha_bar[b_ids].unsqueeze(-1)          # [Nodes, 1]
-
+            def compute_v_loss(trans_obj, noisy, x_pred, x_true, t_s, b_ids, mask):
+                alpha_bar = trans_obj.var_sched.alpha_bars[t_s][b_ids].unsqueeze(-1)
                 c0 = torch.sqrt(alpha_bar)
-                c1 = torch.sqrt(1.0 - alpha_bar)
+                c1 = torch.sqrt(1.0 - alpha_bar).clamp(min=0.05) # Clip for stability
                 
-                # Clip denominator for stability (as per PDF Algorithm 1, typically 0.05 equivalent)
-                c1_clipped = c1.clamp(min=0.05)
+                v_target = (c0 * noisy - x_true) / c1
+                v_pred   = (c0 * noisy - x_pred) / c1
+                return F.mse_loss(v_pred[mask], v_target[mask], reduction='none').sum(dim=-1)
 
-                # Target v (computed from ground truth x0)
-                v_target = (c0 * noisy_val - x0_true) / c1_clipped
-                
-                # Predicted v (computed from predicted x0)
-                v_pred = (c0 * noisy_val - x0_pred) / c1_clipped
-                
-                # MSE Loss on v
-                loss = F.mse_loss(v_pred[mask], v_target[mask], reduction='none').sum(dim=-1)
-                return loss
-
-            loss_X_per_node = compute_v_loss(self.trans_x, X_noisy, X_0_pred, X_0, t, batch_ids, generate_mask)
-            loss_H_per_node = compute_v_loss(self.trans_h, H_noisy, H_0_pred, H_0, t, batch_ids, generate_mask)
-
-            loss_dict = {}
-            loss_dict['X'] = loss_X_per_node.sum() / (generate_mask.sum().float() + 1e-8)
-            loss_dict['H'] = loss_H_per_node.sum() / (generate_mask.sum().float() + 1e-8)
+            loss_X = compute_v_loss(self.trans_x, X_noisy, X_0_pred, X_0, t, batch_ids, generate_mask)
+            loss_H = compute_v_loss(self.trans_h, H_noisy, H_0_pred, H_0, t, batch_ids, generate_mask)
+            
+            loss_dict['X'] = loss_X.sum() / (generate_mask.sum().float() + 1e-8)
+            loss_dict['H'] = loss_H.sum() / (generate_mask.sum().float() + 1e-8)
 
         else:
-            # --- Standard Epsilon Pred ---
-            batch_ids = length_to_batch_id(lengths)
-            batch_size = batch_ids.max() + 1
-            if t == None: # sample time step
-                t = torch.randint(0, self.num_steps + 1, (batch_size,), dtype=torch.long, device=H_0.device)
-
-            X_noisy, eps_X = self.trans_x.add_noise(X_0, generate_mask, batch_ids, t)
-            H_noisy, eps_H = self.trans_h.add_noise(H_0, generate_mask, batch_ids, t)
-
-            edges, edge_types = self._get_edges(chain_ids, batch_ids, lengths)
-
-            beta = self.trans_x.get_timestamp(t)[batch_ids]  # [N]
-            eps_H_pred, eps_X_pred = self.eps_net(
-                H_noisy, X_noisy, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta
-            )
-
-            loss_dict = {}
-
-            # equivariant vector feature loss
-            loss_X = F.mse_loss(eps_X_pred[generate_mask], eps_X[generate_mask], reduction='none').sum(dim=-1)  # (Ntgt * n_latent_channel)
-            loss_X = loss_X.sum() / (generate_mask.sum().float() + 1e-8)
-            loss_dict['X'] = loss_X
-
-            # invariant scalar feature loss
-            loss_H = F.mse_loss(eps_H_pred[generate_mask], eps_H[generate_mask], reduction='none').sum(dim=-1)  # [N]
-            loss_H = loss_H.sum() / (generate_mask.sum().float() + 1e-8)
-            loss_dict['H'] = loss_H
+            # --- epsilon-pred mode ---
+            eps_H_pred, eps_X_pred = model_out_H, model_out_X
+            
+            loss_X = F.mse_loss(eps_X_pred[generate_mask], eps_X[generate_mask], reduction='none').sum(dim=-1)
+            loss_H = F.mse_loss(eps_H_pred[generate_mask], eps_H[generate_mask], reduction='none').sum(dim=-1)
+            
+            loss_dict['X'] = loss_X.sum() / (generate_mask.sum().float() + 1e-8)
+            loss_dict['H'] = loss_H.sum() / (generate_mask.sum().float() + 1e-8)
 
         return loss_dict
 
@@ -233,22 +214,18 @@ class FullDPM(nn.Module):
             generate_mask,
             lengths,
             pbar=False,
-            # energy_func=None,
-            # energy_lambda=0.01,
+            ispred_x=None, # Defaults to None to use self.ispred_x
         ):
-        """
-        Args:
-            H: contextual hidden states, (N, latent_size)
-            X: contextual atomic coordinates, (N, 14, 3)
-            L: cholesky decomposition of the covariance matrix \Sigma=LL^T, (bs, 3, 3)
-            energy_func: guide diffusion towards lower energy landscape
-        """
+        
+        # Use instance configuration if not overridden
+        if ispred_x is None:
+            ispred_x = self.ispred_x
+
         batch_ids = length_to_batch_id(lengths)
 
-        # Set the orientation and position of residues to be predicted to random values
-        X_rand = torch.randn_like(X) # [N, 3]
+        # Random initialization
+        X_rand = torch.randn_like(X)
         X_init = torch.where(generate_mask[:, None].expand_as(X), X_rand, X)
-
         H_rand = torch.randn_like(H)
         H_init = torch.where(generate_mask[:, None].expand_as(H), H_rand, H)
 
@@ -262,24 +239,33 @@ class FullDPM(nn.Module):
 
         for t in pbar(range(self.num_steps, 0, -1)):
             X_t, H_t = traj[t]
-            X_t, H_t = torch.round(X_t, decimals=4), torch.round(H_t, decimals=4) # reduce numerical error
             
             beta = self.trans_x.get_timestamp(t).view(1).repeat(X_t.shape[0])
             t_tensor = torch.full([X_t.shape[0], ], fill_value=t, dtype=torch.long, device=X_t.device)
 
-            eps_H, eps_X = self.eps_net(
+            # Network prediction
+            model_out_H, model_out_X = self.eps_net(
                 H_t, X_t, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta
             )
 
-            # Note: Ensure the sampler is compatible with the prediction mode used during training.
-            # Standard DDPM denoise expects epsilon. If model predicts x, conversion is needed here too.
-            # Assuming epsilon-pred mode for standard sampling in this snippet.
-            
+            if ispred_x:
+                # --- x-pred sampling logic ---
+                # 1. Reconstruct x0 from residual
+                H_0_pred = H_t + model_out_H
+                X_0_pred = X_t + model_out_X
+                
+                # 2. Convert predicted x0 to epsilon
+                eps_H = self._get_eps_from_x0(self.trans_h, H_t, H_0_pred, t_tensor, batch_ids)
+                eps_X = self._get_eps_from_x0(self.trans_x, X_t, X_0_pred, t_tensor, batch_ids)
+            else:
+                # --- epsilon-pred sampling logic ---
+                eps_H, eps_X = model_out_H, model_out_X
+
+            # 3. Standard Denoise Step (expects epsilon)
             H_next = self.trans_h.denoise(H_t, eps_H, generate_mask, batch_ids, t_tensor)
-            # X_next = self.trans_x.denoise(X_t, eps_X, generate_mask, batch_ids, t_tensor, guidance=energy_eps_X, guidance_weight=energy_lambda)
             X_next = self.trans_x.denoise(X_t, eps_X, generate_mask, batch_ids, t_tensor)
 
             traj[t-1] = (X_next, H_next)
-            traj[t] = (traj[t][0].cpu(), traj[t][1].cpu()) # Move previous states to cpu memory.
+            traj[t] = (traj[t][0].cpu(), traj[t][1].cpu()) 
         
         return traj
