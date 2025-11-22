@@ -219,21 +219,26 @@ python -m scripts.data_process.molecule.crossdocked --split ${PREFIX}/CrossDocke
 
 Training of the full UniMoMo requires 8 GPUs with 80G memmory each. The process includes training an all-atom variational encoder, and a block-level latent diffusion model, which commonly takes about 2-3 days. We also enable TF32 by setting the environment variable `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1` for accelerated training and optimized GPU memory usage.
 
+X-Prediction Mode (Recommended):
+To train the latent diffusion model in x-prediction mode (predicting clean latent states instead of noise, which follows the "Back to Basics" philosophy), you can append the --ispred_x flag to the training command (typically in train.py). This mode is often more stable for high-dimensional generation tasks.
+
 ```bash
-GPU=0,1,2,3,4,5,6,7 bash scripts/train_pipe.sh ./ckpts/unimomo ./configs/IterAE/train.yaml ./configs/LDM/train.yaml
+GPU=0,1,2,3,4,5,6,7 bash scripts/train_pipe.sh ./ckpts/unimomo ./configs/IterAE/train.yaml ./configs/LDM/train.yaml --ispred_x 
 ```
 
 ### Inference
 
 The following commands generate 100 candidates for each target in the test sets, which are LNR, RAbD, and CrossDocked test set for peptide, antibody, and small molecule, respectively.
 
+Note: If the model was trained using x-prediction mode, you must add the --ispred_x flag to the inference commands below to ensure correct sampling.
+
 ```bash
 # peptide
-python generate.py --config configs/test/test_pep.yaml --ckpt /path/to/checkpoint.ckpt --gpu 0 --save_dir ./results/pep
+python generate.py --config configs/test/test_pep.yaml --ckpt /path/to/checkpoint.ckpt --gpu 0 --save_dir ./results/pep --ispred_x
 # antibody
-python generate.py --config configs/test/test_ab.yaml --ckpt /path/to/checkpoint.ckpt --gpu 0 --save_dir ./results/ab
+python generate.py --config configs/test/test_ab.yaml --ckpt /path/to/checkpoint.ckpt --gpu 0 --save_dir ./results/ab --ispred_x
 # small molecule
-python generate.py --config configs/test/test_mol.yaml --ckpt /path/to/checkpoint.ckpt --gpu 0 --save_dir ./results/mol
+python generate.py --config configs/test/test_mol.yaml --ckpt /path/to/checkpoint.ckpt --gpu 0 --save_dir ./results/mol --ispred_x
 ```
 
 ### Evaluation
