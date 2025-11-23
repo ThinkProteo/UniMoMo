@@ -34,16 +34,25 @@ class MixDatasetWrapper(torch.utils.data.Dataset):
         return None, None  # this is not possible
 
     def update_epoch(self):
+        # Refresh sub-datasets and rebuild lengths each epoch to stay in sync with any filtering.
+        self.cum_len = []
+        self.total_len = 0
         for dataset in self.datasets:
             if hasattr(dataset, 'update_epoch'):
                 dataset.update_epoch()
+            self.total_len += len(dataset)
+            self.cum_len.append(self.total_len)
         if self.weights is None:
             self.dynamic_idx = [i for i in range(self.total_len)]
         else:
             self.dynamic_idx = []
             start_idx = 0
             for i, (w, dataset) in enumerate(zip(self.weights, self.datasets)):
-                add_len, end_idx = int(len(dataset) * w), self.cum_len[i]
+                end_idx = self.cum_len[i]
+                add_len = int(len(dataset) * w)
+                if add_len <= 0:
+                    start_idx = end_idx
+                    continue
                 self.dynamic_idx.extend(np.random.choice(
                     list(range(start_idx, end_idx)),
                     size=add_len, replace=True # maybe weight > 1.0

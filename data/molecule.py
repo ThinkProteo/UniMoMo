@@ -1,21 +1,34 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
 import torch
+from typing import Optional
 
-from data.bioparse.hierarchy import remove_mols, add_dummy_mol
-from data.bioparse.utils import recur_index
+from .bioparse.hierarchy import remove_mols, add_dummy_mol
+from .bioparse.utils import recur_index
 from utils import register as R
 
 from .peptide import PeptideDataset
 from .resample import SizeResampler, SizeSamplerByPocketSpace
 from .base import transform_data
 
-
 @R.register('MoleculeDataset')
 class MoleculeDataset(PeptideDataset):
 
-    def __init__(self, mmap_dir, specify_data = None, specify_index = None, cluster = None, length_type = 'atom', sample_size = False):
-        super().__init__(mmap_dir, specify_data, specify_index, cluster, length_type)
+    def __init__(
+            self,
+            mmap_dir,
+            specify_data = None,
+            specify_index = None,
+            cluster = None,
+            length_type = 'atom',
+            sample_size = False,
+            prompt_jsonl = None,
+            strict_prompt: Optional[bool] = None,
+        ):
+        if prompt_jsonl is None:
+            from .utils import default_prompt_path
+            prompt_jsonl = default_prompt_path('molecule')
+        super().__init__(mmap_dir, specify_data, specify_index, cluster, length_type, prompt_jsonl, strict_prompt)
         if sample_size:
             # self.size_sampler = SizeResampler(**sample_size_opt)
             self.size_sampler = SizeSamplerByPocketSpace()

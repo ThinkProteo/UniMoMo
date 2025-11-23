@@ -5,10 +5,11 @@ from dataclasses import dataclass
 
 import torch
 
-from data.bioparse import Block, Complex, VOCAB, const
-from data.bioparse.utils import recur_index, index_to_numerical_index, is_aa
+from .bioparse import Block, Complex, VOCAB, const
+from .bioparse.utils import recur_index, index_to_numerical_index, is_aa
 
 from .mmap_dataset import MMAPDataset
+from .utils import load_prompt_jsonl, encode_prompt_text
 
 '''
 Base class
@@ -33,9 +34,42 @@ class BaseDataset(MMAPDataset):
             mmap_dir: str,
             specify_data: Optional[str] = None,
             specify_index: Optional[str] = None,
+            prompt_jsonl: Optional[str] = None,
+            strict_prompt: Optional[bool] = None,
         ) -> None:
         super().__init__(mmap_dir, specify_data, specify_index)
         self.mmap_dir = mmap_dir
+        self._prompt_map = load_prompt_jsonl(prompt_jsonl) if prompt_jsonl else None
+        # default non-strict to avoid hard failures on missing ids
+        self.strict_prompt = False if strict_prompt is None else strict_prompt
+        self._missing_prompt_warned = False
+        self._cdr_suffix = {'HCDR1','HCDR2','HCDR3','LCDR1','LCDR2','LCDR3'}
+
+    def _find_prompt(self, sample_id: str):
+        # try exact match
+        if self._prompt_map is None:
+            return None
+        sid = sample_id.strip()
+        if sid in self._prompt_map:
+            return self._prompt_map[sid]
+        if sid.lower() in self._prompt_map:
+            return self._prompt_map[sid.lower()]
+        # strip CDR suffix if present
+        if '/' in sid:
+            base_id, suffix = sid.rsplit('/', 1)
+            if suffix in self._cdr_suffix:
+                if base_id in self._prompt_map:
+                    return self._prompt_map[base_id]
+                if base_id.lower() in self._prompt_map:
+                    return self._prompt_map[base_id.lower()]
+            sid = base_id
+        # trim trailing underscores if any
+        trimmed = sid.rstrip('_')
+        if trimmed in self._prompt_map:
+            return self._prompt_map[trimmed]
+        if trimmed.lower() in self._prompt_map:
+            return self._prompt_map[trimmed.lower()]
+        return None
 
     ########## Start of Overloading ##########
 
@@ -75,6 +109,19 @@ class BaseDataset(MMAPDataset):
         data = transform_data(cplx, summary.select_indexes)
         data['generate_mask'] = torch.tensor(summary.generate_mask, dtype=torch.bool)
         data['center_mask'] = torch.tensor(summary.center_mask, dtype=torch.bool)
+        data['sample_id'] = summary.id
+
+        # attach text fields if prompt map is provided (otherwise empty tensors)
+        prompt = self._find_prompt(summary.id)
+        if prompt is None and self.strict_prompt:
+            raise KeyError(f'Prompt not found for id {repr(summary.id)}')
+        if prompt is None and not self._missing_prompt_warned and self._prompt_map is not None:
+            print(f'[WARN] Prompt not found for id {repr(summary.id)} (prompt_jsonl provided). Continuing with empty text.')
+            self._missing_prompt_warned = True
+        text_tokens = encode_prompt_text(prompt)
+        data['prompt_text'] = prompt if prompt is not None else ''
+        data['text_tokens'] = text_tokens
+        data['text_lengths'] = torch.tensor([len(text_tokens)], dtype=torch.long)
         return data
 
     def collate_fn(self, batch):
@@ -83,12 +130,20 @@ class BaseDataset(MMAPDataset):
             values = [item[key] for item in batch]
             if key == 'lengths':
                 results[key] = torch.tensor(values, dtype=torch.long)
+            elif key == 'text_lengths':
+                results[key] = torch.cat(values, dim=0)
             elif key == 'bonds': # need to add offsets
                 offset = 0
                 for i, bonds in enumerate(values):
                     bonds[:, :2] = bonds[:, :2] + offset # src/dst
                     offset += len(batch[i]['A'])
                 results[key] = torch.cat(values, dim=0)
+            elif key in ['text_tokens'] and len(values[0].shape) > 0:
+                results[key] = torch.cat(values, dim=0)
+            elif isinstance(values[0], torch.Tensor):
+                results[key] = torch.cat(values, dim=0)
+            elif isinstance(values[0], str):
+                results[key] = values
             else:
                 results[key] = torch.cat(values, dim=0)
         return results

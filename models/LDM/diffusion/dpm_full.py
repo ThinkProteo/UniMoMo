@@ -28,7 +28,8 @@ class EpsilonNet(nn.Module):
             input_size,
             hidden_size,
             encoder_type='EPT',
-            opt={ 'n_layers': 3 }
+            opt={ 'n_layers': 3 },
+            bagel_mode="generation",
         ):
         super().__init__()
         
@@ -41,6 +42,7 @@ class EpsilonNet(nn.Module):
         self.hidden2input = nn.Linear(hidden_size, input_size)
         self.edge_embedding = nn.Embedding(2, edge_embed_size)
         self.time_embedding = SinusoidalTimeEmbeddings(hidden_size)
+        self.bagel_mode = bagel_mode
 
     def forward(
             self,
@@ -52,6 +54,9 @@ class EpsilonNet(nn.Module):
             generate_mask,
             batch_ids,
             beta,
+            text_k=None,
+            text_v=None,
+            mask_text=None,
         ):
         """
         Args:
@@ -64,13 +69,19 @@ class EpsilonNet(nn.Module):
             eps_H: (N, hidden_size)
             eps_X: (N, 3)
         """
+        if self.bagel_mode == "joint":
+            assert text_k is not None, "text_k should be provided in joint mode"
+            assert text_v is not None, "text_v should be provided in joint mode"
+            assert mask_text is not None, "mask_text should be provided in joint mode"
+
         t_embed = self.time_embedding(beta)
         in_feat = torch.cat([H_noisy, cond_embedding, t_embed], dim=-1)
         in_feat = self.input_mlp(in_feat)
         edge_embed = self.edge_embedding(edge_types)
         block_ids = torch.arange(in_feat.shape[0], device=in_feat.device)
         
-        next_H, next_X = self.encoder(in_feat, X_noisy, block_ids, batch_ids, edges, edge_embed)
+        next_H, next_X = self.encoder(in_feat, X_noisy, block_ids, batch_ids, edges, edge_embed,
+                                      text_k=text_k, text_v=text_v, mask_text=mask_text)
 
         # equivariant vector features changes
         eps_X = next_X - X_noisy
@@ -97,14 +108,16 @@ class FullDPM(nn.Module):
         trans_pos_opt={}, 
         trans_seq_opt={},
         encoder_opt={},
-        ispred_x=False  # <--- Added to fix TypeError
+        bagel_mode="generation",
+        ispred_x=False
     ):
         super().__init__()
-        self.eps_net = EpsilonNet(latent_size, hidden_size, encoder_type, encoder_opt)
+        self.eps_net = EpsilonNet(latent_size, hidden_size, encoder_type, encoder_opt, bagel_mode=bagel_mode)
         self.num_steps = num_steps
         self.trans_x = construct_transition(trans_pos_type, num_steps, trans_pos_opt)
         self.trans_h = construct_transition(trans_seq_type, num_steps, trans_seq_opt)
-        self.ispred_x = ispred_x  # Store the config
+        self.bagel_mode = bagel_mode
+        self.ispred_x = ispred_x
 
     @torch.no_grad()
     def _get_edges(self, chain_ids, batch_ids, lengths):
@@ -145,35 +158,45 @@ class FullDPM(nn.Module):
             generate_mask,      # [Nblock]
             lengths,            # [batch size]
             t=None,
-            ispred_x=None       # Defaults to None to use self.ispred_x
+            ispred_x=None,
+            text_k=None,
+            text_v=None,
+            mask_text=None,
         ):
         
+        # if L is not None:
+        #     L = L / self.std
+        if self.bagel_mode == "joint":
+            assert text_k is not None, "text_k should be provided in joint mode"
+            assert text_v is not None, "text_v should be provided in joint mode"
+            assert mask_text is not None, "mask_text should be provided in joint mode"
+
         # Use instance configuration if not overridden
         if ispred_x is None:
             ispred_x = self.ispred_x
 
-        batch_ids = length_to_batch_id(lengths)
-        batch_size = batch_ids.max() + 1
-        
-        if t is None: 
-            t = torch.randint(0, self.num_steps + 1, (batch_size,), dtype=torch.long, device=H_0.device)
-
-        # 1. Add Noise
-        X_noisy, eps_X = self.trans_x.add_noise(X_0, generate_mask, batch_ids, t)
-        H_noisy, eps_H = self.trans_h.add_noise(H_0, generate_mask, batch_ids, t)
-
-        edges, edge_types = self._get_edges(chain_ids, batch_ids, lengths)
-        beta = self.trans_x.get_timestamp(t)[batch_ids]
-
-        # 2. Predict
-        model_out_H, model_out_X = self.eps_net(
-            H_noisy, X_noisy, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta
-        )
-
-        loss_dict = {}
-
         if ispred_x:
-            # --- x-pred mode with v-loss ---
+            # --- x-pred mode with v-loss (Back to Basics / JiT style) ---
+            batch_ids = length_to_batch_id(lengths)
+            batch_size = batch_ids.max() + 1
+            if t is None: 
+                t = torch.randint(0, self.num_steps + 1, (batch_size,), dtype=torch.long, device=H_0.device)
+
+            # 1. Add noise
+            X_noisy, eps_X = self.trans_x.add_noise(X_0, generate_mask, batch_ids, t)
+            H_noisy, eps_H = self.trans_h.add_noise(H_0, generate_mask, batch_ids, t)
+
+            edges, edge_types = self._get_edges(chain_ids, batch_ids, lengths)
+            beta = self.trans_x.get_timestamp(t)[batch_ids]
+
+            # 2. Run Network to predict residuals
+            # EpsilonNet outputs: model_out = x_pred - noisy
+            model_out_H, model_out_X = self.eps_net(
+                H_noisy, X_noisy, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta, 
+                text_k=text_k, text_v=text_v, mask_text=mask_text
+            )
+            
+            # 3. Reconstruct x_0 (prediction)
             X_0_pred = X_noisy + model_out_X
             H_0_pred = H_noisy + model_out_H
 
@@ -189,18 +212,39 @@ class FullDPM(nn.Module):
             loss_X = compute_v_loss(self.trans_x, X_noisy, X_0_pred, X_0, t, batch_ids, generate_mask)
             loss_H = compute_v_loss(self.trans_h, H_noisy, H_0_pred, H_0, t, batch_ids, generate_mask)
             
+            loss_dict = {}
             loss_dict['X'] = loss_X.sum() / (generate_mask.sum().float() + 1e-8)
             loss_dict['H'] = loss_H.sum() / (generate_mask.sum().float() + 1e-8)
 
         else:
-            # --- epsilon-pred mode ---
-            eps_H_pred, eps_X_pred = model_out_H, model_out_X
-            
-            loss_X = F.mse_loss(eps_X_pred[generate_mask], eps_X[generate_mask], reduction='none').sum(dim=-1)
-            loss_H = F.mse_loss(eps_H_pred[generate_mask], eps_H[generate_mask], reduction='none').sum(dim=-1)
-            
-            loss_dict['X'] = loss_X.sum() / (generate_mask.sum().float() + 1e-8)
-            loss_dict['H'] = loss_H.sum() / (generate_mask.sum().float() + 1e-8)
+            # --- Standard Epsilon Pred ---
+            batch_ids = length_to_batch_id(lengths)
+            batch_size = batch_ids.max() + 1
+            if t is None: # sample time step
+                t = torch.randint(0, self.num_steps + 1, (batch_size,), dtype=torch.long, device=H_0.device)
+
+            X_noisy, eps_X = self.trans_x.add_noise(X_0, generate_mask, batch_ids, t)
+            H_noisy, eps_H = self.trans_h.add_noise(H_0, generate_mask, batch_ids, t)
+
+            edges, edge_types = self._get_edges(chain_ids, batch_ids, lengths)
+
+            beta = self.trans_x.get_timestamp(t)[batch_ids]  # [N]
+            eps_H_pred, eps_X_pred = self.eps_net(
+                H_noisy, X_noisy, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta,
+                text_k=text_k, text_v=text_v, mask_text=mask_text
+            )
+
+            loss_dict = {}
+
+            # equivariant vector feature loss
+            loss_X = F.mse_loss(eps_X_pred[generate_mask], eps_X[generate_mask], reduction='none').sum(dim=-1)  # (Ntgt * n_latent_channel)
+            loss_X = loss_X.sum() / (generate_mask.sum().float() + 1e-8)
+            loss_dict['X'] = loss_X
+
+            # invariant scalar feature loss
+            loss_H = F.mse_loss(eps_H_pred[generate_mask], eps_H[generate_mask], reduction='none').sum(dim=-1)  # [N]
+            loss_H = loss_H.sum() / (generate_mask.sum().float() + 1e-8)
+            loss_dict['H'] = loss_H
 
         return loss_dict
 

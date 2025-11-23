@@ -21,9 +21,14 @@ class AntibodyDataset(BaseDataset):
             # cluster: Optional[str] = None,
             length_type: str = 'atom',
             cdr_type: List[str] = ['HCDR1', 'HCDR2', 'HCDR3', 'LCDR1', 'LCDR2', 'LCDR3'],
-            test_mode: bool = False # extend all CDRs
+            test_mode: bool = False, # extend all CDRs
+            prompt_jsonl: Optional[str] = None,
+            strict_prompt: Optional[bool] = None,
         ) -> None:
-        super().__init__(mmap_dir, specify_data, specify_index)
+        if prompt_jsonl is None:
+            from .utils import default_prompt_path
+            prompt_jsonl = default_prompt_path('antibody')
+        super().__init__(mmap_dir, specify_data, specify_index, prompt_jsonl, strict_prompt)
         self.mmap_dir = mmap_dir
         # self.resampler = ClusterResampler(cluster) if cluster else None  # should only be used in training!
         self.length_type = length_type

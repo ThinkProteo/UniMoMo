@@ -18,9 +18,14 @@ class PeptideDataset(BaseDataset):
             specify_data: Optional[str] = None,
             specify_index: Optional[str] = None,
             cluster: Optional[str] = None,
-            length_type: str = 'atom'
+            length_type: str = 'atom',
+            prompt_jsonl: Optional[str] = None,
+            strict_prompt: Optional[bool] = None,
         ) -> None:
-        super().__init__(mmap_dir, specify_data, specify_index)
+        if prompt_jsonl is None:
+            from .utils import default_prompt_path
+            prompt_jsonl = default_prompt_path('peptide')
+        super().__init__(mmap_dir, specify_data, specify_index, prompt_jsonl, strict_prompt)
         self.mmap_dir = mmap_dir
         self.resampler = ClusterResampler(cluster) if cluster else None  # should only be used in training!
         self.length_type = length_type
