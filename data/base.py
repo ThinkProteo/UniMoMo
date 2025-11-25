@@ -39,6 +39,8 @@ class BaseDataset(MMAPDataset):
         ) -> None:
         super().__init__(mmap_dir, specify_data, specify_index)
         self.mmap_dir = mmap_dir
+<<<<<<< Updated upstream
+=======
         self._prompt_map = load_prompt_jsonl(prompt_jsonl) if prompt_jsonl else None
         # default non-strict to avoid hard failures on missing ids
         self.strict_prompt = False if strict_prompt is None else strict_prompt
@@ -50,11 +52,15 @@ class BaseDataset(MMAPDataset):
         if self._prompt_map is None:
             return None
         sid = sample_id.strip()
+        # DEBUG: Print lookup attempt
+        # print(f"Looking up prompt for: '{sid}'")
+        
         if sid in self._prompt_map:
             return self._prompt_map[sid]
         if sid.lower() in self._prompt_map:
             return self._prompt_map[sid.lower()]
-        # strip CDR suffix if present
+        
+        # strip CDR suffix if present (e.g. 4fqv_BA_H_L/HCDR3 -> 4fqv_BA_H_L)
         if '/' in sid:
             base_id, suffix = sid.rsplit('/', 1)
             if suffix in self._cdr_suffix:
@@ -62,14 +68,18 @@ class BaseDataset(MMAPDataset):
                     return self._prompt_map[base_id]
                 if base_id.lower() in self._prompt_map:
                     return self._prompt_map[base_id.lower()]
-            sid = base_id
+            # Fallback: try looking up the full ID anyway in case the map has the suffix
+            sid = base_id 
+
         # trim trailing underscores if any
         trimmed = sid.rstrip('_')
         if trimmed in self._prompt_map:
             return self._prompt_map[trimmed]
         if trimmed.lower() in self._prompt_map:
             return self._prompt_map[trimmed.lower()]
+            
         return None
+>>>>>>> Stashed changes
 
     ########## Start of Overloading ##########
 
@@ -109,19 +119,29 @@ class BaseDataset(MMAPDataset):
         data = transform_data(cplx, summary.select_indexes)
         data['generate_mask'] = torch.tensor(summary.generate_mask, dtype=torch.bool)
         data['center_mask'] = torch.tensor(summary.center_mask, dtype=torch.bool)
+<<<<<<< Updated upstream
+=======
         data['sample_id'] = summary.id
 
         # attach text fields if prompt map is provided (otherwise empty tensors)
         prompt = self._find_prompt(summary.id)
         if prompt is None and self.strict_prompt:
-            raise KeyError(f'Prompt not found for id {repr(summary.id)}')
+            # Soft failure for missing prompts instead of crashing
+            print(f'[WARN] Strict prompt enabled but prompt not found for id {repr(summary.id)}. Using empty prompt.')
+            prompt = "" 
+            # raise KeyError(f'Prompt not found for id {repr(summary.id)}')
         if prompt is None and not self._missing_prompt_warned and self._prompt_map is not None:
             print(f'[WARN] Prompt not found for id {repr(summary.id)} (prompt_jsonl provided). Continuing with empty text.')
             self._missing_prompt_warned = True
-        text_tokens = encode_prompt_text(prompt)
-        data['prompt_text'] = prompt if prompt is not None else ''
+        
+        # ensure prompt is not None for encoding
+        prompt_to_encode = prompt if prompt is not None else ""
+        text_tokens = encode_prompt_text(prompt_to_encode)
+        
+        data['prompt_text'] = prompt_to_encode
         data['text_tokens'] = text_tokens
         data['text_lengths'] = torch.tensor([len(text_tokens)], dtype=torch.long)
+>>>>>>> Stashed changes
         return data
 
     def collate_fn(self, batch):
