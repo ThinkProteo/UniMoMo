@@ -32,8 +32,7 @@ class LDMMolDesign(nn.Module):
             h_loss_weight=None,
             std=10.0,
             is_aa_corrupt_ratio=0.1,
-            diffusion_opt={},
-            bagel_mode="generation",
+            diffusion_opt={}
         ):
         super().__init__()
         self.latent_deterministic = latent_deterministic
@@ -44,7 +43,7 @@ class LDMMolDesign(nn.Module):
         for param in self.autoencoder.parameters():
             param.requires_grad = False
         self.autoencoder.eval()
-        self.bagel_mode = bagel_mode
+
         latent_size = self.autoencoder.latent_size
 
         # topo embedding
@@ -68,7 +67,6 @@ class LDMMolDesign(nn.Module):
             latent_size=latent_size,
             hidden_size=hidden_size,
             num_steps=num_steps,
-            bagel_mode=bagel_mode,
             **diffusion_opt
         )
         if h_loss_weight is None:
@@ -81,7 +79,7 @@ class LDMMolDesign(nn.Module):
     @oom_decorator
     def forward(
             self,
-            X,              # [Natom, 3], atom coordinates     
+            X,              # [Natom, 3], atom coordinates
             S,              # [Nblock], block types
             A,              # [Natom], atom types
             bonds,          # [Nbonds, 3], chemical bonds, src-dst-type (single: 1, double: 2, triple: 3)
@@ -92,17 +90,14 @@ class LDMMolDesign(nn.Module):
             block_lengths,  # [Nblock], number of atoms in each block
             lengths,        # [batch_size]
             is_aa,          # [Nblock], 1 for amino acid (for determining the X_mask in inverse folding)
-            text_k=None, 
-            text_v=None, 
-            mask_text=None,
+            text_k=None,    # Optional: [B, L_text, n_kv_heads, d_head] text key features
+            text_v=None,    # Optional: [B, L_text, n_kv_heads, d_head] text value features
+            mask_text=None, # Optional: [B, L_text] text attention mask
         ):
         '''
-            L: [bs, 3, 3], cholesky decomposition of the covariance matrix \Sigma = LL^T
+            Optional text conditioning via text_k, text_v, mask_text.
+            When None, model behaves exactly as original UniMoMo.
         '''
-        if self.bagel_mode == "joint":
-            assert text_k is not None, "text_k should be provided in joint mode"
-            assert text_v is not None, "text_v should be provided in joint mode"
-            assert mask_text is not None, "mask_text should be provided in joint mode"
 
         # encode latent_H_0 (N*d) and latent_X_0 (N*3)
         with torch.no_grad():
@@ -141,7 +136,7 @@ class LDMMolDesign(nn.Module):
             mask_text=mask_text,
         )
 
-        # loss
+        # loss - RESTORED: Original UniMoMo formula with h_loss_weight
         loss_dict['total'] = loss_dict['H'] * self.h_loss_weight + loss_dict['X']
 
         return loss_dict

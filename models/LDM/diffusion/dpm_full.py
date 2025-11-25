@@ -28,11 +28,10 @@ class EpsilonNet(nn.Module):
             input_size,
             hidden_size,
             encoder_type='EPT',
-            opt={ 'n_layers': 3 },
-            bagel_mode="generation",
+            opt={ 'n_layers': 3 }
         ):
         super().__init__()
-        
+
         edge_embed_size = hidden_size // 4
         self.input_mlp = MLP(
             input_size + hidden_size * 2, # latent variable, cond embedding, time embedding
@@ -42,7 +41,6 @@ class EpsilonNet(nn.Module):
         self.hidden2input = nn.Linear(hidden_size, input_size)
         self.edge_embedding = nn.Embedding(2, edge_embed_size)
         self.time_embedding = SinusoidalTimeEmbeddings(hidden_size)
-        self.bagel_mode = bagel_mode
 
     def forward(
             self,
@@ -54,9 +52,9 @@ class EpsilonNet(nn.Module):
             generate_mask,
             batch_ids,
             beta,
-            text_k=None,
-            text_v=None,
-            mask_text=None,
+            text_k=None,    # Optional: text key features for conditioning
+            text_v=None,    # Optional: text value features for conditioning
+            mask_text=None, # Optional: text attention mask
         ):
         """
         Args:
@@ -65,15 +63,11 @@ class EpsilonNet(nn.Module):
             generate_mask: (N)
             batch_ids: (N)
             beta: (N)
+            text_k, text_v, mask_text: Optional text conditioning inputs
         Returns:
             eps_H: (N, hidden_size)
             eps_X: (N, 3)
         """
-        if self.bagel_mode == "joint":
-            assert text_k is not None, "text_k should be provided in joint mode"
-            assert text_v is not None, "text_v should be provided in joint mode"
-            assert mask_text is not None, "mask_text should be provided in joint mode"
-
         t_embed = self.time_embedding(beta)
         in_feat = torch.cat([H_noisy, cond_embedding, t_embed], dim=-1)
         in_feat = self.input_mlp(in_feat)
@@ -98,25 +92,23 @@ class EpsilonNet(nn.Module):
 class FullDPM(nn.Module):
 
     def __init__(
-        self, 
+        self,
         latent_size,
         hidden_size,
-        num_steps, 
+        num_steps,
         trans_pos_type='Diffusion',
         trans_seq_type='Diffusion',
         encoder_type='EPT',
-        trans_pos_opt={}, 
+        trans_pos_opt={},
         trans_seq_opt={},
         encoder_opt={},
-        bagel_mode="generation",
         ispred_x=False
     ):
         super().__init__()
-        self.eps_net = EpsilonNet(latent_size, hidden_size, encoder_type, encoder_opt, bagel_mode=bagel_mode)
+        self.eps_net = EpsilonNet(latent_size, hidden_size, encoder_type, encoder_opt)
         self.num_steps = num_steps
         self.trans_x = construct_transition(trans_pos_type, num_steps, trans_pos_opt)
         self.trans_h = construct_transition(trans_seq_type, num_steps, trans_seq_opt)
-        self.bagel_mode = bagel_mode
         self.ispred_x = ispred_x
 
     @torch.no_grad()
@@ -159,17 +151,10 @@ class FullDPM(nn.Module):
             lengths,            # [batch size]
             t=None,
             ispred_x=None,
-            text_k=None,
-            text_v=None,
-            mask_text=None,
+            text_k=None,    # Optional: text key features for conditioning
+            text_v=None,    # Optional: text value features for conditioning
+            mask_text=None, # Optional: text attention mask
         ):
-        
-        # if L is not None:
-        #     L = L / self.std
-        if self.bagel_mode == "joint":
-            assert text_k is not None, "text_k should be provided in joint mode"
-            assert text_v is not None, "text_v should be provided in joint mode"
-            assert mask_text is not None, "mask_text should be provided in joint mode"
 
         # Use instance configuration if not overridden
         if ispred_x is None:

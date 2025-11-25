@@ -442,30 +442,21 @@ class EPTLayerMoT(nn.Module):
 
 class EPTAttentionMoT(nn.Module):
     """
-    MoT-style EPT attention (inference only).
+    MoT-style EPT attention with BATCHED computation.
 
-    VAE branch input (same as original SelfAttnLayer):
+    VAE branch input:
         H: [B, N_vae_max, d_hidden]
         V: [B, N_vae_max, 3, d_hidden]
 
-    Text branch provides K/V (scalar part only), computed externally:
-        text_k: [B, L_text_max, n_kv_heads, d_attn]   (d_attn = 4 * d_head)
+    Text branch provides K/V (computed externally by Qwen3):
+        text_k: [B, L_text_max, n_kv_heads, d_head]
         text_v: [B, L_text_max, n_kv_heads, d_head]
-        Note: text has no vector channel input, vector values are filled with 0.
+        Note: Text has no vector channel; vector values are padded with zeros.
 
-    cached_info (same as original EPT SelfAttnLayer):
-        D_batch:         [B, N_vae_max, N_vae_max]
-        rbf_feat_batch:  List[Tensor], one per layer [B, n_heads, N_vae_max, N_vae_max]
+    cached_info (same as original EPT):
+        D_batch:         [B, N_vae_max, N_vae_max] - pairwise distances
+        rbf_feat_batch:  Tensor [n_layers, B, n_heads, N_vae_max, N_vae_max] - RBF features
         H_mask:          [B, N_vae_max], 1=valid, 0=pad
-
-    Original geometric bias:
-        bias = rbf_feat_batch[layer_idx] + D_batch.unsqueeze(1)
-        bias = bias.masked_fill(H_mask == 0, -inf)
-
-    Here, we only apply bias to the vae→vae sub-block:
-        - Q: only from vae tokens
-        - K/V: concat([text, vae]) along length dimension
-        - bias only applied to K columns from vae, text columns have bias=0
 
     Returns:
         H_out: [B, N_vae_max, d_hidden]
@@ -484,7 +475,7 @@ class EPTAttentionMoT(nn.Module):
         vector_act: str = "none",
         attn_bias: bool = True,
         qk_norm: bool = True,
-        num_kv_groups: int = 4,  # original setting of Qwen3, n_q_head=32, n_kv_head=8
+        num_kv_groups: int = 4,  # For GQA: n_q_heads = n_kv_heads * num_kv_groups
     ):
         super().__init__()
 
@@ -492,232 +483,147 @@ class EPTAttentionMoT(nn.Module):
         self.n_heads = n_heads
         self.layer_idx = layer_idx
 
+        # GQA configuration
         self.num_kv_groups = num_kv_groups
         self.n_kv_heads = n_heads
         self.n_q_heads = self.n_kv_heads * self.num_kv_groups
-
         self.d_head = d_hidden // self.n_q_heads
-        self.d_attn = 4 * self.d_head  # 与原 EPT SelfAttn 的 4 * d_head 对齐
-        self.factor = 0.5 / math.sqrt(self.d_head)  # 保留原 EPT 的 scaling 因子风格
 
-        # VAE branch projections: H -> Q,K,H_v; V -> V_v
-        self.scaler_q = nn.Linear(d_hidden, self.n_q_heads * self.d_attn, bias=attn_bias)
-        self.scaler_k = nn.Linear(d_hidden, self.n_kv_heads * self.d_attn, bias=attn_bias)
+        # Scale factor for attention (defined once, not as magic number)
+        self.scale_factor = 0.5 / math.sqrt(self.d_head)
+
+        # VAE branch projections (match original EPT SelfAttnLayer)
+        self.scaler_q = nn.Linear(d_hidden, self.n_q_heads * self.d_head, bias=attn_bias)
+        self.scaler_k = nn.Linear(d_hidden, self.n_kv_heads * self.d_head, bias=attn_bias)
         self.scaler_v = nn.Linear(d_hidden, self.n_kv_heads * self.d_head, bias=attn_bias)
         self.vector_v = nn.Linear(d_hidden, self.n_kv_heads * self.d_head, bias=False)
 
-        # Output projections for VAE tokens
+        # Output projections
         self.scalar_o = nn.Linear(self.n_q_heads * self.d_head, d_hidden)
         self.vector_o = nn.Linear(self.n_q_heads * self.d_head, d_hidden, bias=False)
 
-        # LayerNorm for qkv of vae and text
+        # LayerNorm for Q/K
         if qk_norm:
-            self.q_norm_vae = nn.LayerNorm(self.d_attn)
-            self.k_norm_vae = nn.LayerNorm(self.d_attn)
-            self.k_norm_text = nn.LayerNorm(self.d_attn)
+            self.q_norm = nn.LayerNorm(self.d_head)
+            self.k_norm = nn.LayerNorm(self.d_head)
         else:
-            self.q_norm_vae = nn.Identity()
-            self.k_norm_vae = nn.Identity()
-            self.k_norm_text = nn.Identity()
-
-        self.efficient = False
-
-    @staticmethod
-    def _resize_head_axis(tensor: torch.Tensor, target_heads: int) -> torch.Tensor:
-        """
-        Resize the head axis of a tensor with shape [B, L, H, D] to target_heads using 1D interpolation.
-        This keeps per-token information while deterministically combining/splitting heads.
-        """
-        if tensor.ndim != 4:
-            raise ValueError(f"Expected tensor with 4 dims [B, L, H, D], got shape {tuple(tensor.shape)}")
-        _, seq_len, head_count, _ = tensor.shape
-        if head_count == target_heads or seq_len == 0:
-            return tensor
-
-        tensor_reshaped = tensor.permute(0, 1, 3, 2).contiguous()  # [B, L, D, H]
-        tensor_reshaped = tensor_reshaped.view(-1, 1, head_count)  # treat heads as length dimension
-        tensor_resized = F.interpolate(
-            tensor_reshaped,
-            size=target_heads,
-            mode="linear",
-            align_corners=False,
-        )
-        tensor_resized = tensor_resized.view(*tensor.shape[:2], tensor.shape[3], target_heads)
-        tensor_resized = tensor_resized.permute(0, 1, 3, 2).contiguous()
-        return tensor_resized
-
-    @staticmethod
-    def _match_last_dim(tensor: torch.Tensor, target_dim: int) -> torch.Tensor:
-        """
-        Pad or truncate the last dimension of a tensor to match target_dim.
-        """
-        current_dim = tensor.shape[-1]
-        if current_dim == target_dim or tensor.shape[1] == 0:  # seq_len == 0
-            return tensor
-        if current_dim > target_dim:
-            return tensor[..., :target_dim]
-        pad = target_dim - current_dim
-        return F.pad(tensor, (0, pad))
-
-    def _align_text_heads_and_dim(self, tensor: torch.Tensor, target_heads: int, target_dim: int) -> torch.Tensor:
-        """
-        Ensure the incoming text tensor matches the head count and per-head dimensionality expected by EPT.
-        """
-        if tensor.shape[2] != target_heads:
-            tensor = self._resize_head_axis(tensor, target_heads)
-        if tensor.shape[-1] != target_dim:
-            tensor = self._match_last_dim(tensor, target_dim)
-        return tensor.contiguous()
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
 
     def forward(
         self,
-        H: torch.Tensor,
-        V: torch.Tensor,
-        cached_info=None,
-        text_k: Optional[torch.Tensor] = None,
-        text_v: Optional[torch.Tensor] = None,
-        mask_text: Optional[torch.Tensor] = None,
-    ):
-        """
-        Forward pass that wraps forward_inference.
-        During training, text inputs should be None (backward compatibility).
-        """
-        return self._forward(H, V, cached_info, text_k, text_v, mask_text)
-
-    def _forward(
-        self,
         H: torch.Tensor,  # [B, N_vae_max, d_hidden]
         V: torch.Tensor,  # [B, N_vae_max, 3, d_hidden]
-        cached_info,  # (D_batch, rbf_feat_batch, H_mask)
-        text_k: Optional[torch.Tensor] = None,  # [B, L_text_max, n_kv_heads, d_attn]
+        cached_info,      # (D_batch, rbf_feat_batch, H_mask)
+        text_k: Optional[torch.Tensor] = None,  # [B, L_text_max, n_kv_heads, d_head]
         text_v: Optional[torch.Tensor] = None,  # [B, L_text_max, n_kv_heads, d_head]
         mask_text: Optional[torch.Tensor] = None,  # [B, L_text_max], 1=valid
     ):
+        """
+        BATCHED forward pass (no per-sample loop).
+        Text conditioning is optional; when None, behaves like original EPT.
+        """
         B, N_vae_max, _ = H.shape
         device = H.device
 
         D_batch, rbf_feat_batch, H_mask = cached_info  # H_mask: [B, N_vae_max]
 
-        # Handle text inputs (VAE-only mode if text_k/text_v are None)
+        # Handle text inputs
         if text_k is None or text_v is None:
             L_text_max = 0
-            text_k = H.new_zeros(B, 0, self.n_kv_heads, self.d_attn)
+            text_k = H.new_zeros(B, 0, self.n_kv_heads, self.d_head)
             text_v = H.new_zeros(B, 0, self.n_kv_heads, self.d_head)
-            mask_text = H.new_zeros(B, 0, dtype=torch.bool)
+            mask_text = H.new_ones(B, 0, dtype=torch.bool)
         else:
-            assert text_k.shape[0] == B, "batch size mismatch for text_k"
+            assert text_k.shape[0] == B, f"Batch size mismatch: text_k has {text_k.shape[0]}, expected {B}"
             L_text_max = text_k.shape[1]
+
+            # Validate dimensions (no silent padding/truncation)
+            assert text_k.shape[2] == self.n_kv_heads, \
+                f"Text K head count mismatch: expected {self.n_kv_heads}, got {text_k.shape[2]}"
+            assert text_k.shape[3] == self.d_head, \
+                f"Text K dimension mismatch: expected {self.d_head}, got {text_k.shape[3]}"
+            assert text_v.shape[2] == self.n_kv_heads, \
+                f"Text V head count mismatch: expected {self.n_kv_heads}, got {text_v.shape[2]}"
+            assert text_v.shape[3] == self.d_head, \
+                f"Text V dimension mismatch: expected {self.d_head}, got {text_v.shape[3]}"
+
             if mask_text is None:
                 mask_text = torch.ones(B, L_text_max, dtype=torch.bool, device=device)
 
-            # Align text head count & dimensions with EPTMoT expectations
-            text_k = self._align_text_heads_and_dim(text_k, self.n_kv_heads, self.d_attn)
-            text_v = self._align_text_heads_and_dim(text_v, self.n_kv_heads, self.d_head)
-
         # Compute VAE Q/K/V projections
-        H_q_vae_all = self.scaler_q(H).view(B, N_vae_max, self.n_q_heads, self.d_attn)  # [B, N, n_q_heads, d_attn]
-        H_k_vae_all = self.scaler_k(H).view(B, N_vae_max, self.n_kv_heads, self.d_attn)  # [B, N, n_kv_heads, d_attn]
-        H_v_vae_all = self.scaler_v(H).view(B, N_vae_max, self.n_kv_heads, self.d_head)  # [B, N, n_kv_heads, d_head]
+        H_q_vae = self.scaler_q(H).view(B, N_vae_max, self.n_q_heads, self.d_head)
+        H_k_vae = self.scaler_k(H).view(B, N_vae_max, self.n_kv_heads, self.d_head)
+        H_v_vae = self.scaler_v(H).view(B, N_vae_max, self.n_kv_heads, self.d_head)
 
-        # Process vector features and concat with scalar values
-        V_v_vae_all = self.vector_v(V).view(B, N_vae_max, 3, self.n_kv_heads, self.d_head)
-        V_v_vae_all = V_v_vae_all.transpose(-2, -3).flatten(start_dim=-2)  # [B, N, n_kv_heads, 3*d_head]
-        V_attn_vae_all = torch.cat([H_v_vae_all, V_v_vae_all], dim=-1)  # [B, N, n_kv_heads, 4*d_head]
+        # Vector features: [B, N, 3, n_kv_heads, d_head] -> [B, N, n_kv_heads, 3*d_head]
+        V_v_vae = self.vector_v(V).view(B, N_vae_max, 3, self.n_kv_heads, self.d_head)
+        V_v_vae = V_v_vae.transpose(-2, -3).flatten(start_dim=-2)  # [B, N, n_kv_heads, 3*d_head]
 
-        # Apply normalization to text keys
-        k_text_all = self.k_norm_text(text_k)  # [B, L_text_max, n_kv_heads, d_attn]
+        # Concatenate scalar + vector for VAE values: [B, N, n_kv_heads, 4*d_head]
+        V_attn_vae = torch.cat([H_v_vae, V_v_vae], dim=-1)
 
-        # Text has no vector channel, fill with zeros
-        V_v_text_all = torch.zeros(B, L_text_max, self.n_kv_heads, 3 * self.d_head, device=device, dtype=H.dtype)
-        V_attn_text_all = torch.cat([text_v, V_v_text_all], dim=-1)  # [B, L_text_max, n_kv_heads, 4*d_head]
+        # Text has no vector channel - pad with zeros: [B, L_text, n_kv_heads, 4*d_head]
+        V_v_text_zeros = torch.zeros(B, L_text_max, self.n_kv_heads, 3 * self.d_head, device=device, dtype=H.dtype)
+        V_attn_text = torch.cat([text_v, V_v_text_zeros], dim=-1)
 
-        # Initialize output tensors
-        H_vae_out = H.new_zeros(B, N_vae_max, self.d_hidden)  # [B, N, d_hidden]
-        V_vae_out = V.new_zeros(B, N_vae_max, 3, self.d_hidden)  # [B, N, 3, d_hidden]
+        # Apply normalization (per-head)
+        H_q_vae = self.q_norm(H_q_vae)  # [B, N, n_q_heads, d_head]
+        H_k_vae = self.k_norm(H_k_vae)  # [B, N, n_kv_heads, d_head]
+        text_k = self.k_norm(text_k)    # [B, L_text, n_kv_heads, d_head]
 
-        # Process each batch element separately
-        for b in range(B):
-            # Get valid token indices
-            text_valid_idx = mask_text[b].nonzero(as_tuple=False).squeeze(-1)  # [L_text_b]
-            vae_valid_idx = H_mask[b].nonzero(as_tuple=False).squeeze(-1)  # [L_vae_b]
+        # ========== BATCHED ATTENTION ==========
 
-            L_text_b = int(text_valid_idx.numel())
-            L_vae_b = int(vae_valid_idx.numel())
-            if L_vae_b == 0:
-                continue  # Skip if no VAE tokens
+        # Concatenate text and VAE K/V along sequence dimension
+        K_full = torch.cat([text_k, H_k_vae], dim=1)  # [B, L_text + N_vae, n_kv_heads, d_head]
+        V_full = torch.cat([V_attn_text, V_attn_vae], dim=1)  # [B, L_text + N_vae, n_kv_heads, 4*d_head]
+        L_total = L_text_max + N_vae_max
 
-            # Extract VAE Q/K/V for valid tokens
-            H_q_vae = H_q_vae_all[b, vae_valid_idx]  # [L_vae_b, n_q_heads, d_attn]
-            H_k_vae = H_k_vae_all[b, vae_valid_idx]  # [L_vae_b, n_kv_heads, d_attn]
-            H_v_vae = H_v_vae_all[b, vae_valid_idx]  # [L_vae_b, n_kv_heads, d_head]
-            V_attn_vae = V_attn_vae_all[b, vae_valid_idx]  # [L_vae_b, n_kv_heads, 4*d_head]
+        # Reshape for multi-head attention: [B, n_heads, L, d]
+        q = H_q_vae.transpose(1, 2)  # [B, n_q_heads, N_vae, d_head]
+        k = K_full.transpose(1, 2)   # [B, n_kv_heads, L_total, d_head]
+        v = V_full.transpose(1, 2)   # [B, n_kv_heads, L_total, 4*d_head]
 
-            # Apply normalization
-            q_vae = self.q_norm_vae(H_q_vae)  # [L_vae_b, n_q_heads, d_attn]
-            k_vae = self.k_norm_vae(H_k_vae)  # [L_vae_b, n_kv_heads, d_attn]
+        # Expand K/V for grouped query attention
+        k = k.repeat_interleave(self.num_kv_groups, dim=1)  # [B, n_q_heads, L_total, d_head]
+        v = v.repeat_interleave(self.num_kv_groups, dim=1)  # [B, n_q_heads, L_total, 4*d_head]
 
-            # Extract text K/V for valid tokens
-            if L_text_b > 0:
-                k_text = k_text_all[b, text_valid_idx]  # [L_text_b, n_kv_heads, d_attn]
-                V_attn_text = V_attn_text_all[b, text_valid_idx]  # [L_text_b, n_kv_heads, 4*d_head]
-            else:
-                k_text = k_text_all.new_zeros(0, self.n_kv_heads, self.d_attn)
-                V_attn_text = V_attn_text_all.new_zeros(0, self.n_kv_heads, 4 * self.d_head)
+        # Build attention bias (only for VAE-VAE interactions)
+        bias_geom = rbf_feat_batch[self.layer_idx] + D_batch.unsqueeze(1)  # [B, h_geom, N_vae, N_vae]
 
-            # Concatenate text and VAE K/V
-            K_cat = torch.cat([k_text, k_vae], dim=0)  # [L_k, n_kv_heads, d_attn]
-            V_cat = torch.cat([V_attn_text, V_attn_vae], dim=0)  # [L_k, n_kv_heads, 4*d_head]
-            L_k = L_text_b + L_vae_b
+        # Average over geometric heads if multiple
+        if bias_geom.shape[1] > 1:
+            bias_vae_scalar = bias_geom.mean(dim=1)  # [B, N_vae, N_vae]
+        else:
+            bias_vae_scalar = bias_geom.squeeze(1)   # [B, N_vae, N_vae]
 
-            # Reshape for multi-head attention: [1, n_heads, L, d]
-            q_b = q_vae.permute(1, 0, 2).unsqueeze(0)  # [1, n_q_heads, L_vae_b, d_attn]
-            k_b = K_cat.permute(1, 0, 2).unsqueeze(0)  # [1, n_kv_heads, L_k, d_attn]
-            v_b = V_cat.permute(1, 0, 2).unsqueeze(0)  # [1, n_kv_heads, L_k, 4*d_head]
+        # Create full bias matrix: [B, n_q_heads, N_vae, L_total]
+        bias_full = torch.zeros(B, self.n_q_heads, N_vae_max, L_total, device=device, dtype=H.dtype)
+        # Apply geometric bias only to VAE tokens (last N_vae columns)
+        bias_full[:, :, :, L_text_max:] = bias_vae_scalar.unsqueeze(1)  # Broadcast to all query heads
 
-            # Expand K/V for grouped query attention
-            k_b_exp = k_b.repeat_interleave(self.num_kv_groups, dim=1)  # [1, n_q_heads, L_k, d_attn]
-            v_b_exp = v_b.repeat_interleave(self.num_kv_groups, dim=1)  # [1, n_q_heads, L_k, 4*d_head]
+        # Apply padding masks
+        combined_mask = torch.cat([mask_text, H_mask], dim=1)  # [B, L_total]
+        bias_full = bias_full.masked_fill(~combined_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
 
-            # Compute EPT geometric bias from RBF features
-            bias_full = rbf_feat_batch[self.layer_idx][b] + D_batch[b].unsqueeze(0)  # [h_geom, N, N]
-            mask_b = H_mask[b].unsqueeze(0).unsqueeze(0)  # [1, 1, N]
-            bias_full = bias_full.masked_fill(mask_b == 0, float("-inf"))
+        # Compute attention
+        attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k)  # [B, n_q_heads, N_vae, L_total]
+        attn = F.softmax(attn_scores * self.scale_factor + bias_full, dim=-1)
+        out = torch.einsum('bhqk,bhkd->bhqd', attn, v)  # [B, n_q_heads, N_vae, 4*d_head]
 
-            # Extract VAE-VAE bias and average over geometric heads if needed
-            bias_vae_local = bias_full[:, vae_valid_idx][:, :, vae_valid_idx]  # [h_geom, L_vae_b, L_vae_b]
-            h_geom = bias_vae_local.shape[0]
-            if h_geom > 1:
-                bias_vae_scalar = bias_vae_local.mean(dim=0)  # [L_vae_b, L_vae_b]
-            else:
-                bias_vae_scalar = bias_vae_local[0]  # [L_vae_b, L_vae_b]
+        # Reshape output: [B, n_q_heads, N_vae, 4*d_head] → [B, N_vae, n_q_heads, 4*d_head]
+        out = out.transpose(1, 2)
 
-            # Construct total bias: apply geometric bias only to VAE tokens, not text
-            bias_total = q_b.new_zeros(1, self.n_q_heads, L_vae_b, L_k)  # [1, n_q_heads, L_vae_b, L_k]
-            if L_vae_b > 0:
-                # First L_text_b columns are text (no geometric bias), last L_vae_b columns are VAE
-                bias_total[:, :, :, L_text_b:] = bias_vae_scalar.unsqueeze(0).unsqueeze(0)
+        # Split scalar and vector parts
+        H_out = out[..., :self.d_head].reshape(B, N_vae_max, self.n_q_heads * self.d_head)  # [B, N, d_hidden]
+        V_out_flat = out[..., self.d_head:].reshape(B, N_vae_max, self.n_q_heads, 3, self.d_head)
+        V_out = V_out_flat.transpose(-2, -3).reshape(B, N_vae_max, 3, self.n_q_heads * self.d_head)
 
-            # Compute attention scores with scaling and bias
-            attn_scores = torch.einsum("bhqd,bhkd -> bhqk", q_b, k_b_exp)  # [1, n_q_heads, L_vae_b, L_k]
-            attn = attn_scores * (0.5 / math.sqrt(self.d_head)) + bias_total
-            attn = F.softmax(attn, dim=-1)  # [1, n_q_heads, L_vae_b, L_k]
-            res = torch.einsum("bhqk,bhkd -> bhqd", attn, v_b_exp)  # [1, n_q_heads, L_vae_b, 4*d_head]
-            res = res.squeeze(0).permute(1, 0, 2)  # [L_vae_b, n_q_heads, 4*d_head]
+        # Output projections
+        H_final = self.scalar_o(H_out)
+        V_final = self.vector_o(V_out)
 
-            # Split result into scalar and vector parts
-            H_res = res[:, :, : self.d_head].reshape(L_vae_b, self.n_q_heads * self.d_head)  # [L_vae_b, d_hidden]
-            V_part = res[:, :, self.d_head:]  # [L_vae_b, n_q_heads, 3*d_head]
-            V_part = V_part.view(L_vae_b, self.n_q_heads, 3, self.d_head)
-            V_part = V_part.permute(0, 2, 1, 3).reshape(L_vae_b, 3, self.n_q_heads * self.d_head)
-            V_res = V_part  # [L_vae_b, 3, n_q_heads * d_head]
-
-            # Apply output projections and scatter back to padded tensor
-            H_proj = self.scalar_o(H_res)  # [L_vae_b, d_hidden]
-            V_proj = self.vector_o(V_res)  # [L_vae_b, 3, d_hidden]
-            H_vae_out[b, vae_valid_idx] = H_proj
-            V_vae_out[b, vae_valid_idx] = V_proj
-
-        return H_vae_out, V_vae_out
+        return H_final, V_final
 
 
 class XTransEncoderActMoT(nn.Module):
