@@ -39,8 +39,6 @@ class BaseDataset(MMAPDataset):
         ) -> None:
         super().__init__(mmap_dir, specify_data, specify_index)
         self.mmap_dir = mmap_dir
-<<<<<<< Updated upstream
-=======
         self._prompt_map = load_prompt_jsonl(prompt_jsonl) if prompt_jsonl else None
         # default non-strict to avoid hard failures on missing ids
         self.strict_prompt = False if strict_prompt is None else strict_prompt
@@ -79,7 +77,6 @@ class BaseDataset(MMAPDataset):
             return self._prompt_map[trimmed.lower()]
             
         return None
->>>>>>> Stashed changes
 
     ########## Start of Overloading ##########
 
@@ -119,8 +116,6 @@ class BaseDataset(MMAPDataset):
         data = transform_data(cplx, summary.select_indexes)
         data['generate_mask'] = torch.tensor(summary.generate_mask, dtype=torch.bool)
         data['center_mask'] = torch.tensor(summary.center_mask, dtype=torch.bool)
-<<<<<<< Updated upstream
-=======
         data['sample_id'] = summary.id
 
         # attach text fields if prompt map is provided (otherwise empty tensors)
@@ -141,7 +136,6 @@ class BaseDataset(MMAPDataset):
         data['prompt_text'] = prompt_to_encode
         data['text_tokens'] = text_tokens
         data['text_lengths'] = torch.tensor([len(text_tokens)], dtype=torch.long)
->>>>>>> Stashed changes
         return data
 
     def collate_fn(self, batch):
