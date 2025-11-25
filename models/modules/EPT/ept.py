@@ -92,6 +92,7 @@ class Transformer(nn.Module):
         sparse_k=None,
         efficient=False,
         vector_act="none",
+        num_kv_groups=4,
     ):
         super().__init__()
 
@@ -392,6 +393,7 @@ class EPTLayerMoT(nn.Module):
         efficient=False,
         vector_act="none",
         attn_bias=True,
+        num_kv_groups=4,
     ):
         super(EPTLayerMoT, self).__init__()
         self.attn_layer = SubLayerWrapper(
@@ -405,6 +407,7 @@ class EPTLayerMoT(nn.Module):
                 residual=residual,
                 vector_act=vector_act,
                 attn_bias=attn_bias,
+                num_kv_groups=num_kv_groups,
             ),
             d_hidden,
             layer_norm,
@@ -487,6 +490,11 @@ class EPTAttentionMoT(nn.Module):
         self.num_kv_groups = num_kv_groups
         self.n_kv_heads = n_heads
         self.n_q_heads = self.n_kv_heads * self.num_kv_groups
+        if d_hidden % self.n_q_heads != 0:
+            raise ValueError(
+                f"d_hidden ({d_hidden}) must be divisible by n_q_heads (n_kv_heads={self.n_kv_heads} * "
+                f"num_kv_groups={self.num_kv_groups} = {self.n_q_heads})"
+            )
         self.d_head = d_hidden // self.n_q_heads
 
         # Scale factor for attention (defined once, not as magic number)
@@ -651,6 +659,7 @@ class XTransEncoderActMoT(nn.Module):
         attn_bias=True,
         efficient=False,
         vector_act="none",
+        num_kv_groups=4,
     ) -> None:
         super().__init__()
 
@@ -669,6 +678,7 @@ class XTransEncoderActMoT(nn.Module):
             sparse_k=sparse_k,
             efficient=efficient,
             vector_act=vector_act,
+            num_kv_groups=num_kv_groups,
         )
 
     def forward(
@@ -747,6 +757,7 @@ class TransformerMoT(nn.Module):
         sparse_k=None,
         efficient=False,
         vector_act="none",
+        num_kv_groups=4,
     ):
         super().__init__()
 
@@ -757,6 +768,7 @@ class TransformerMoT(nn.Module):
         self.sparse_k = sparse_k
         self.efficient = efficient
         self._local_mask = local_mask
+        self.num_kv_groups = num_kv_groups
         if self.efficient and not xformers_enable:
             print(
                 "xformers are not downloaded, change into custom attention mechanism. "
@@ -807,6 +819,7 @@ class TransformerMoT(nn.Module):
                     self.efficient,
                     vector_act,
                     attn_bias,
+                    num_kv_groups,
                 ),
             )
 

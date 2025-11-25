@@ -93,6 +93,7 @@ class LDMMolDesign(nn.Module):
             text_k=None,    # Optional: [B, L_text, n_kv_heads, d_head] text key features
             text_v=None,    # Optional: [B, L_text, n_kv_heads, d_head] text value features
             mask_text=None, # Optional: [B, L_text] text attention mask
+            t=None,         # Optional: fixed timestep for debugging/overfitting
         ):
         '''
             Optional text conditioning via text_k, text_v, mask_text.
@@ -134,6 +135,7 @@ class LDMMolDesign(nn.Module):
             text_k=text_k,
             text_v=text_v,
             mask_text=mask_text,
+            t=t,
         )
 
         # loss - RESTORED: Original UniMoMo formula with h_loss_weight
