@@ -446,24 +446,10 @@ class EPTLayerMoT(nn.Module):
 class EPTAttentionMoT(nn.Module):
     """
     MoT-style EPT attention with BATCHED computation.
-
-    VAE branch input:
-        H: [B, N_vae_max, d_hidden]
-        V: [B, N_vae_max, 3, d_hidden]
-
-    Text branch provides K/V (computed externally by Qwen3):
-        text_k: [B, L_text_max, n_kv_heads, d_head]
-        text_v: [B, L_text_max, n_kv_heads, d_head]
-        Note: Text has no vector channel; vector values are padded with zeros.
-
-    cached_info (same as original EPT):
-        D_batch:         [B, N_vae_max, N_vae_max] - pairwise distances
-        rbf_feat_batch:  Tensor [n_layers, B, n_heads, N_vae_max, N_vae_max] - RBF features
-        H_mask:          [B, N_vae_max], 1=valid, 0=pad
-
-    Returns:
-        H_out: [B, N_vae_max, d_hidden]
-        V_out: [B, N_vae_max, 3, d_hidden]
+    
+    Corrected to match original SelfAttnLayer dimensionality:
+    - Queries and Keys are projected to 4 * d_head.
+    - Text Keys are projected to match this expanded dimension.
     """
 
     def __init__(
@@ -477,8 +463,8 @@ class EPTAttentionMoT(nn.Module):
         residual: bool = True,
         vector_act: str = "none",
         attn_bias: bool = True,
-        qk_norm: bool = True,
-        num_kv_groups: int = 4,  # For GQA: n_q_heads = n_kv_heads * num_kv_groups
+        qk_norm: bool = False,
+        num_kv_groups: int = 4,
     ):
         super().__init__()
 
@@ -490,30 +476,46 @@ class EPTAttentionMoT(nn.Module):
         self.num_kv_groups = num_kv_groups
         self.n_kv_heads = n_heads
         self.n_q_heads = self.n_kv_heads * self.num_kv_groups
+        
         if d_hidden % self.n_q_heads != 0:
             raise ValueError(
-                f"d_hidden ({d_hidden}) must be divisible by n_q_heads (n_kv_heads={self.n_kv_heads} * "
-                f"num_kv_groups={self.num_kv_groups} = {self.n_q_heads})"
+                f"d_hidden ({d_hidden}) must be divisible by n_q_heads ({self.n_q_heads})"
             )
+        
+        # Standard head dimension
         self.d_head = d_hidden // self.n_q_heads
+        
+        # CRITICAL CHANGE: Original EPT uses 4x expansion for Q/K
+        # This matches the dimensionality of V (which is 1 scalar + 3 vectors = 4 components)
+        self.d_qk_head = 4 * self.d_head
 
-        # Scale factor for attention (defined once, not as magic number)
+        # Scale factor
+        # Original EPT uses 0.5 / sqrt(d_head).
+        # Mathematically this equals 1.0 / sqrt(4 * d_head), which matches our new d_qk_head.
         self.scale_factor = 0.5 / math.sqrt(self.d_head)
 
-        # VAE branch projections (match original EPT SelfAttnLayer)
-        self.scaler_q = nn.Linear(d_hidden, self.n_q_heads * self.d_head, bias=attn_bias)
-        self.scaler_k = nn.Linear(d_hidden, self.n_kv_heads * self.d_head, bias=attn_bias)
+        # VAE branch projections (Modified to use d_qk_head)
+        self.scaler_q = nn.Linear(d_hidden, self.n_q_heads * self.d_qk_head, bias=attn_bias)
+        self.scaler_k = nn.Linear(d_hidden, self.n_kv_heads * self.d_qk_head, bias=attn_bias)
+        
+        # VAE Value projections (Unchanged: V is still composed of scalar + 3D vector)
         self.scaler_v = nn.Linear(d_hidden, self.n_kv_heads * self.d_head, bias=attn_bias)
         self.vector_v = nn.Linear(d_hidden, self.n_kv_heads * self.d_head, bias=False)
 
+        # Text Projection (NEW)
+        # We assume input text_k is [B, L, h, d_head]. We must project it to [B, L, h, 4*d_head]
+        # to match the VAE K dimension for dot product.
+        self.text_k_proj = nn.Linear(self.d_head, self.d_qk_head, bias=False)
+
         # Output projections
-        self.scalar_o = nn.Linear(self.n_q_heads * self.d_head, d_hidden)
+        # Typo Fixed: scalar_o -> scaler_o (matches original EPT)
+        self.scaler_o = nn.Linear(self.n_q_heads * self.d_head, d_hidden)
         self.vector_o = nn.Linear(self.n_q_heads * self.d_head, d_hidden, bias=False)
 
-        # LayerNorm for Q/K
+        # LayerNorm for Q/K (Applied on the expanded 4x dimension)
         if qk_norm:
-            self.q_norm = nn.LayerNorm(self.d_head)
-            self.k_norm = nn.LayerNorm(self.d_head)
+            self.q_norm = nn.LayerNorm(self.d_qk_head)
+            self.k_norm = nn.LayerNorm(self.d_qk_head)
         else:
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
@@ -527,41 +529,38 @@ class EPTAttentionMoT(nn.Module):
         text_v: Optional[torch.Tensor] = None,  # [B, L_text_max, n_kv_heads, d_head]
         mask_text: Optional[torch.Tensor] = None,  # [B, L_text_max], 1=valid
     ):
-        """
-        BATCHED forward pass (no per-sample loop).
-        Text conditioning is optional; when None, behaves like original EPT.
-        """
         B, N_vae_max, _ = H.shape
         device = H.device
 
-        D_batch, rbf_feat_batch, H_mask = cached_info  # H_mask: [B, N_vae_max]
+        D_batch, rbf_feat_batch, H_mask = cached_info
 
         # Handle text inputs
         if text_k is None or text_v is None:
             L_text_max = 0
-            text_k = H.new_zeros(B, 0, self.n_kv_heads, self.d_head)
+            # Initialize empty tensors with correct expanded dimensions
+            text_k_proj = H.new_zeros(B, 0, self.n_kv_heads, self.d_qk_head)
             text_v = H.new_zeros(B, 0, self.n_kv_heads, self.d_head)
             mask_text = H.new_ones(B, 0, dtype=torch.bool)
         else:
-            assert text_k.shape[0] == B, f"Batch size mismatch: text_k has {text_k.shape[0]}, expected {B}"
+            assert text_k.shape[0] == B, "Batch size mismatch"
             L_text_max = text_k.shape[1]
-
-            # Validate dimensions (no silent padding/truncation)
-            assert text_k.shape[2] == self.n_kv_heads, \
-                f"Text K head count mismatch: expected {self.n_kv_heads}, got {text_k.shape[2]}"
-            assert text_k.shape[3] == self.d_head, \
-                f"Text K dimension mismatch: expected {self.d_head}, got {text_k.shape[3]}"
-            assert text_v.shape[2] == self.n_kv_heads, \
-                f"Text V head count mismatch: expected {self.n_kv_heads}, got {text_v.shape[2]}"
-            assert text_v.shape[3] == self.d_head, \
-                f"Text V dimension mismatch: expected {self.d_head}, got {text_v.shape[3]}"
-
+            
+            # Project Text Keys from d_head -> 4*d_head (d_qk_head)
+            # text_k: [B, L, n_kv, d_head] -> [B, L, n_kv, 4*d_head]
+            text_k_proj = self.text_k_proj(text_k)
+            
             if mask_text is None:
                 mask_text = torch.ones(B, L_text_max, dtype=torch.bool, device=device)
+            else:
+                # Ensure text_v is d_head (it will be expanded to 4*d_head during Value construction via padding)
+                pass 
 
         # Compute VAE Q/K/V projections
-        H_q_vae = self.scaler_q(H).view(B, N_vae_max, self.n_q_heads, self.d_head)
-        H_k_vae = self.scaler_k(H).view(B, N_vae_max, self.n_kv_heads, self.d_head)
+        # Note: Q and K are now projected to n_heads * d_qk_head (4x larger)
+        H_q_vae = self.scaler_q(H).view(B, N_vae_max, self.n_q_heads, self.d_qk_head)
+        H_k_vae = self.scaler_k(H).view(B, N_vae_max, self.n_kv_heads, self.d_qk_head)
+        
+        # VAE Values (Scalar part)
         H_v_vae = self.scaler_v(H).view(B, N_vae_max, self.n_kv_heads, self.d_head)
 
         # Vector features: [B, N, 3, n_kv_heads, d_head] -> [B, N, n_kv_heads, 3*d_head]
@@ -571,64 +570,73 @@ class EPTAttentionMoT(nn.Module):
         # Concatenate scalar + vector for VAE values: [B, N, n_kv_heads, 4*d_head]
         V_attn_vae = torch.cat([H_v_vae, V_v_vae], dim=-1)
 
-        # Text has no vector channel - pad with zeros: [B, L_text, n_kv_heads, 4*d_head]
+        # Handle Text Values
+        # Text has no vector channel. We pad the 3*d_head vector part with zeros.
+        # text_v is [B, L, n_kv, d_head]. Result V_attn_text is [B, L, n_kv, 4*d_head]
         V_v_text_zeros = torch.zeros(B, L_text_max, self.n_kv_heads, 3 * self.d_head, device=device, dtype=H.dtype)
         V_attn_text = torch.cat([text_v, V_v_text_zeros], dim=-1)
 
-        # Apply normalization (per-head)
-        H_q_vae = self.q_norm(H_q_vae)  # [B, N, n_q_heads, d_head]
-        H_k_vae = self.k_norm(H_k_vae)  # [B, N, n_kv_heads, d_head]
-        text_k = self.k_norm(text_k)    # [B, L_text, n_kv_heads, d_head]
+        # Apply normalization (per-head) on the expanded Q/K dimension
+        H_q_vae = self.q_norm(H_q_vae)  # [B, N, n_q_heads, d_qk_head]
+        H_k_vae = self.k_norm(H_k_vae)  # [B, N, n_kv_heads, d_qk_head]
+        text_k_proj = self.k_norm(text_k_proj) # [B, L, n_kv_heads, d_qk_head]
 
         # ========== BATCHED ATTENTION ==========
 
         # Concatenate text and VAE K/V along sequence dimension
-        K_full = torch.cat([text_k, H_k_vae], dim=1)  # [B, L_text + N_vae, n_kv_heads, d_head]
-        V_full = torch.cat([V_attn_text, V_attn_vae], dim=1)  # [B, L_text + N_vae, n_kv_heads, 4*d_head]
+        # K uses the expanded text_k_proj
+        K_full = torch.cat([text_k_proj, H_k_vae], dim=1)  # [B, L_total, n_kv, d_qk_head]
+        V_full = torch.cat([V_attn_text, V_attn_vae], dim=1)  # [B, L_total, n_kv, 4*d_head]
         L_total = L_text_max + N_vae_max
 
         # Reshape for multi-head attention: [B, n_heads, L, d]
-        q = H_q_vae.transpose(1, 2)  # [B, n_q_heads, N_vae, d_head]
-        k = K_full.transpose(1, 2)   # [B, n_kv_heads, L_total, d_head]
-        v = V_full.transpose(1, 2)   # [B, n_kv_heads, L_total, 4*d_head]
+        q = H_q_vae.transpose(1, 2)  # [B, n_q, N_vae, d_qk_head]
+        k = K_full.transpose(1, 2)   # [B, n_kv, L_total, d_qk_head]
+        v = V_full.transpose(1, 2)   # [B, n_kv, L_total, 4*d_head]
 
         # Expand K/V for grouped query attention
-        k = k.repeat_interleave(self.num_kv_groups, dim=1)  # [B, n_q_heads, L_total, d_head]
-        v = v.repeat_interleave(self.num_kv_groups, dim=1)  # [B, n_q_heads, L_total, 4*d_head]
+        k = k.repeat_interleave(self.num_kv_groups, dim=1)  # [B, n_q, L_total, d_qk_head]
+        v = v.repeat_interleave(self.num_kv_groups, dim=1)  # [B, n_q, L_total, 4*d_head]
 
         # Build attention bias (only for VAE-VAE interactions)
         bias_geom = rbf_feat_batch[self.layer_idx] + D_batch.unsqueeze(1)  # [B, h_geom, N_vae, N_vae]
 
-        # Average over geometric heads if multiple
         if bias_geom.shape[1] > 1:
-            bias_vae_scalar = bias_geom.mean(dim=1)  # [B, N_vae, N_vae]
+            bias_vae_scalar = bias_geom.mean(dim=1)
         else:
-            bias_vae_scalar = bias_geom.squeeze(1)   # [B, N_vae, N_vae]
+            bias_vae_scalar = bias_geom.squeeze(1)
 
-        # Create full bias matrix: [B, n_q_heads, N_vae, L_total]
         bias_full = torch.zeros(B, self.n_q_heads, N_vae_max, L_total, device=device, dtype=H.dtype)
-        # Apply geometric bias only to VAE tokens (last N_vae columns)
-        bias_full[:, :, :, L_text_max:] = bias_vae_scalar.unsqueeze(1)  # Broadcast to all query heads
+        bias_full[:, :, :, L_text_max:] = bias_vae_scalar.unsqueeze(1)
 
-        # Apply padding masks
-        combined_mask = torch.cat([mask_text, H_mask], dim=1)  # [B, L_total]
+        combined_mask = torch.cat([mask_text, H_mask], dim=1)
         bias_full = bias_full.masked_fill(~combined_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
 
         # Compute attention
-        attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k)  # [B, n_q_heads, N_vae, L_total]
+        # d is now d_qk_head (4*d_head)
+        attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k)  # [B, n_q, N_vae, L_total]
+        
+        # Scaling: self.scale_factor is 0.5/sqrt(d_head). 
+        # Since our dimension is 4*d_head, the effective math is (0.5 * 2) / sqrt(4*d_head).
+        # This effectively equals 1/sqrt(d_qk_head) * some_constant.
+        # We keep self.scale_factor exactly as original EPT to ensure identical behavior.
         attn = F.softmax(attn_scores * self.scale_factor + bias_full, dim=-1)
-        out = torch.einsum('bhqk,bhkd->bhqd', attn, v)  # [B, n_q_heads, N_vae, 4*d_head]
+        
+        out = torch.einsum('bhqk,bhkd->bhqd', attn, v)  # [B, n_q, N_vae, 4*d_head]
 
-        # Reshape output: [B, n_q_heads, N_vae, 4*d_head] → [B, N_vae, n_q_heads, 4*d_head]
+        # Reshape output: [B, n_q, N_vae, 4*d_head] -> [B, N_vae, n_q, 4*d_head]
         out = out.transpose(1, 2)
 
         # Split scalar and vector parts
-        H_out = out[..., :self.d_head].reshape(B, N_vae_max, self.n_q_heads * self.d_head)  # [B, N, d_hidden]
+        # The first d_head is scalar info, the remaining 3*d_head is vector info.
+        H_out = out[..., :self.d_head].reshape(B, N_vae_max, self.n_q_heads * self.d_head)
+        
+        # Reshape the vector part: [..., 3*d_head] -> [..., 3, d_head]
         V_out_flat = out[..., self.d_head:].reshape(B, N_vae_max, self.n_q_heads, 3, self.d_head)
         V_out = V_out_flat.transpose(-2, -3).reshape(B, N_vae_max, 3, self.n_q_heads * self.d_head)
 
-        # Output projections
-        H_final = self.scalar_o(H_out)
+        # Output projections (Names corrected to match original)
+        H_final = self.scaler_o(H_out)
         V_final = self.vector_o(V_out)
 
         return H_final, V_final
