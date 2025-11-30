@@ -394,6 +394,7 @@ class EPTLayerMoT(nn.Module):
         vector_act="none",
         attn_bias=True,
         num_kv_groups=4,
+        use_flash_attn=True,
     ):
         super(EPTLayerMoT, self).__init__()
         self.attn_layer = SubLayerWrapper(
@@ -408,6 +409,7 @@ class EPTLayerMoT(nn.Module):
                 vector_act=vector_act,
                 attn_bias=attn_bias,
                 num_kv_groups=num_kv_groups,
+                use_flash_attn=use_flash_attn,
             ),
             d_hidden,
             layer_norm,
@@ -465,6 +467,7 @@ class EPTAttentionMoT(nn.Module):
         attn_bias: bool = True,
         qk_norm: bool = False,
         num_kv_groups: int = 4,
+        use_flash_attn: bool = True,
     ):
         super().__init__()
 
@@ -519,6 +522,9 @@ class EPTAttentionMoT(nn.Module):
         else:
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
+
+        # Flash Attention flag
+        self.use_flash_attn = use_flash_attn
 
     def forward(
         self,
@@ -614,15 +620,35 @@ class EPTAttentionMoT(nn.Module):
 
         # Compute attention
         # d is now d_qk_head (4*d_head)
-        attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k)  # [B, n_q, N_vae, L_total]
-        
-        # Scaling: self.scale_factor is 0.5/sqrt(d_head). 
-        # Since our dimension is 4*d_head, the effective math is (0.5 * 2) / sqrt(4*d_head).
-        # This effectively equals 1/sqrt(d_qk_head) * some_constant.
-        # We keep self.scale_factor exactly as original EPT to ensure identical behavior.
-        attn = F.softmax(attn_scores * self.scale_factor + bias_full, dim=-1)
-        
-        out = torch.einsum('bhqk,bhkd->bhqd', attn, v)  # [B, n_q, N_vae, 4*d_head]
+
+        if self.use_flash_attn:
+            # Flash Attention path using PyTorch's scaled_dot_product_attention
+            # This automatically dispatches to Flash Attention kernel when possible
+            try:
+                out = F.scaled_dot_product_attention(
+                    query=q,              # [B, n_q, N_vae, d_qk_head]
+                    key=k,                # [B, n_q, L_total, d_qk_head]
+                    value=v,              # [B, n_q, L_total, 4*d_head]
+                    attn_mask=bias_full,  # [B, n_q, N_vae, L_total]
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=self.scale_factor,
+                )  # [B, n_q, N_vae, 4*d_head]
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                # Fallback to vanilla attention if Flash Attention fails
+                print(f"[EPTAttentionMoT] Flash Attention failed ({type(e).__name__}), falling back to vanilla attention")
+                attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k)  # [B, n_q, N_vae, L_total]
+                attn = F.softmax(attn_scores * self.scale_factor + bias_full, dim=-1)
+                out = torch.einsum('bhqk,bhkd->bhqd', attn, v)  # [B, n_q, N_vae, 4*d_head]
+        else:
+            # Vanilla attention path (original implementation)
+            # Scaling: self.scale_factor is 0.5/sqrt(d_head).
+            # Since our dimension is 4*d_head, the effective math is (0.5 * 2) / sqrt(4*d_head).
+            # This effectively equals 1/sqrt(d_qk_head) * some_constant.
+            # We keep self.scale_factor exactly as original EPT to ensure identical behavior.
+            attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k)  # [B, n_q, N_vae, L_total]
+            attn = F.softmax(attn_scores * self.scale_factor + bias_full, dim=-1)
+            out = torch.einsum('bhqk,bhkd->bhqd', attn, v)  # [B, n_q, N_vae, 4*d_head]
 
         # Reshape output: [B, n_q, N_vae, 4*d_head] -> [B, N_vae, n_q, 4*d_head]
         out = out.transpose(1, 2)
@@ -668,6 +694,7 @@ class XTransEncoderActMoT(nn.Module):
         efficient=False,
         vector_act="none",
         num_kv_groups=4,
+        use_flash_attn=True,
     ) -> None:
         super().__init__()
 
@@ -687,6 +714,7 @@ class XTransEncoderActMoT(nn.Module):
             efficient=efficient,
             vector_act=vector_act,
             num_kv_groups=num_kv_groups,
+            use_flash_attn=use_flash_attn,
         )
 
     def forward(
@@ -766,6 +794,7 @@ class TransformerMoT(nn.Module):
         efficient=False,
         vector_act="none",
         num_kv_groups=4,
+        use_flash_attn=True,
     ):
         super().__init__()
 
@@ -777,6 +806,7 @@ class TransformerMoT(nn.Module):
         self.efficient = efficient
         self._local_mask = local_mask
         self.num_kv_groups = num_kv_groups
+        self.use_flash_attn = use_flash_attn
         if self.efficient and not xformers_enable:
             print(
                 "xformers are not downloaded, change into custom attention mechanism. "
@@ -828,6 +858,7 @@ class TransformerMoT(nn.Module):
                     vector_act,
                     attn_bias,
                     num_kv_groups,
+                    use_flash_attn=self.use_flash_attn,
                 ),
             )
 
