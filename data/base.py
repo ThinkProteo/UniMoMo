@@ -9,7 +9,7 @@ from .bioparse import Block, Complex, VOCAB, const
 from .bioparse.utils import recur_index, index_to_numerical_index, is_aa
 
 from .mmap_dataset import MMAPDataset
-from .utils import load_prompt_jsonl, encode_prompt_text
+from .utils import load_prompt_jsonl, load_prompt_jsonl_extended, encode_prompt_text
 
 '''
 Base class
@@ -36,10 +36,33 @@ class BaseDataset(MMAPDataset):
             specify_index: Optional[str] = None,
             prompt_jsonl: Optional[str] = None,
             strict_prompt: Optional[bool] = None,
+            use_extended_format: Optional[bool] = False,
+            prevent_leakage: Optional[bool] = True,
+            leakage_marker: Optional[str] = '**Foldability:**',
         ) -> None:
         super().__init__(mmap_dir, specify_data, specify_index)
         self.mmap_dir = mmap_dir
-        self._prompt_map = load_prompt_jsonl(prompt_jsonl) if prompt_jsonl else None
+        self.use_extended_format = use_extended_format
+        self.prevent_leakage = prevent_leakage
+        self.leakage_marker = leakage_marker
+
+        # Load prompt data based on format
+        if prompt_jsonl:
+            if use_extended_format:
+                # Load extended format: separate prompt and answer
+                self._prompt_map, self._answer_map = load_prompt_jsonl_extended(
+                    prompt_jsonl,
+                    prevent_leakage=prevent_leakage,
+                    leakage_marker=leakage_marker
+                )
+            else:
+                # Legacy format: single prompt field
+                self._prompt_map = load_prompt_jsonl(prompt_jsonl)
+                self._answer_map = None
+        else:
+            self._prompt_map = None
+            self._answer_map = None
+
         # default non-strict to avoid hard failures on missing ids
         self.strict_prompt = False if strict_prompt is None else strict_prompt
         self._missing_prompt_warned = False
@@ -52,12 +75,12 @@ class BaseDataset(MMAPDataset):
         sid = sample_id.strip()
         # DEBUG: Print lookup attempt
         # print(f"Looking up prompt for: '{sid}'")
-        
+
         if sid in self._prompt_map:
             return self._prompt_map[sid]
         if sid.lower() in self._prompt_map:
             return self._prompt_map[sid.lower()]
-        
+
         # strip CDR suffix if present (e.g. 4fqv_BA_H_L/HCDR3 -> 4fqv_BA_H_L)
         if '/' in sid:
             base_id, suffix = sid.rsplit('/', 1)
@@ -67,7 +90,7 @@ class BaseDataset(MMAPDataset):
                 if base_id.lower() in self._prompt_map:
                     return self._prompt_map[base_id.lower()]
             # Fallback: try looking up the full ID anyway in case the map has the suffix
-            sid = base_id 
+            sid = base_id
 
         # trim trailing underscores if any
         trimmed = sid.rstrip('_')
@@ -75,7 +98,38 @@ class BaseDataset(MMAPDataset):
             return self._prompt_map[trimmed]
         if trimmed.lower() in self._prompt_map:
             return self._prompt_map[trimmed.lower()]
-            
+
+        return None
+
+    def _find_answer(self, sample_id: str):
+        """Find answer (thinking + answer combined) for a sample ID."""
+        if self._answer_map is None:
+            return None
+        sid = sample_id.strip()
+
+        # Try exact match
+        if sid in self._answer_map:
+            return self._answer_map[sid]
+        if sid.lower() in self._answer_map:
+            return self._answer_map[sid.lower()]
+
+        # Strip CDR suffix if present
+        if '/' in sid:
+            base_id, suffix = sid.rsplit('/', 1)
+            if suffix in self._cdr_suffix:
+                if base_id in self._answer_map:
+                    return self._answer_map[base_id]
+                if base_id.lower() in self._answer_map:
+                    return self._answer_map[base_id.lower()]
+            sid = base_id
+
+        # Trim trailing underscores
+        trimmed = sid.rstrip('_')
+        if trimmed in self._answer_map:
+            return self._answer_map[trimmed]
+        if trimmed.lower() in self._answer_map:
+            return self._answer_map[trimmed.lower()]
+
         return None
 
     ########## Start of Overloading ##########
@@ -110,6 +164,14 @@ class BaseDataset(MMAPDataset):
             'block_lengths': [Nblock],
             'is_aa': [Nblock]
             'lengths': [1]
+
+            # Extended format fields (if use_extended_format=True):
+            'prompt_text': str,  # Question only
+            'answer_text': str,  # Thinking + Answer combined
+            'prompt_tokens': [prompt_len],  # Character codes (replaced in collate)
+            'answer_tokens': [answer_len],  # Character codes (replaced in collate)
+            'prompt_lengths': [1],
+            'answer_lengths': [1],
         }
         '''
         cplx, summary = self.get_raw_data(idx), self.get_summary(idx)
@@ -118,24 +180,57 @@ class BaseDataset(MMAPDataset):
         data['center_mask'] = torch.tensor(summary.center_mask, dtype=torch.bool)
         data['sample_id'] = summary.id
 
-        # attach text fields if prompt map is provided (otherwise empty tensors)
-        prompt = self._find_prompt(summary.id)
-        if prompt is None and self.strict_prompt:
-            # Soft failure for missing prompts instead of crashing
-            print(f'[WARN] Strict prompt enabled but prompt not found for id {repr(summary.id)}. Using empty prompt.')
-            prompt = "" 
-            # raise KeyError(f'Prompt not found for id {repr(summary.id)}')
-        if prompt is None and not self._missing_prompt_warned and self._prompt_map is not None:
-            print(f'[WARN] Prompt not found for id {repr(summary.id)} (prompt_jsonl provided). Continuing with empty text.')
-            self._missing_prompt_warned = True
-        
-        # ensure prompt is not None for encoding
-        prompt_to_encode = prompt if prompt is not None else ""
-        text_tokens = encode_prompt_text(prompt_to_encode)
-        
-        data['prompt_text'] = prompt_to_encode
-        data['text_tokens'] = text_tokens
-        data['text_lengths'] = torch.tensor([len(text_tokens)], dtype=torch.long)
+        if self.use_extended_format:
+            # Extended format: separate prompt and answer
+            prompt = self._find_prompt(summary.id)
+            answer = self._find_answer(summary.id)
+
+            # Handle missing data
+            if prompt is None and self.strict_prompt:
+                print(f'[WARN] Strict prompt enabled but prompt not found for id {repr(summary.id)}. Using empty prompt.')
+                prompt = ""
+            if answer is None and self.strict_prompt:
+                print(f'[WARN] Strict prompt enabled but answer not found for id {repr(summary.id)}. Using empty answer.')
+                answer = ""
+
+            if prompt is None and not self._missing_prompt_warned and self._prompt_map is not None:
+                print(f'[WARN] Prompt not found for id {repr(summary.id)} (prompt_jsonl provided). Continuing with empty text.')
+                self._missing_prompt_warned = True
+
+            # Ensure non-None for encoding
+            prompt_to_encode = prompt if prompt is not None else ""
+            answer_to_encode = answer if answer is not None else ""
+
+            # Encode separately (character codes - will be replaced by BPE in collate)
+            prompt_tokens = encode_prompt_text(prompt_to_encode)
+            answer_tokens = encode_prompt_text(answer_to_encode)
+
+            # Add separate fields
+            data['prompt_text'] = prompt_to_encode
+            data['answer_text'] = answer_to_encode
+            data['prompt_tokens'] = prompt_tokens
+            data['answer_tokens'] = answer_tokens
+            data['prompt_lengths'] = torch.tensor([len(prompt_tokens)], dtype=torch.long)
+            data['answer_lengths'] = torch.tensor([len(answer_tokens)], dtype=torch.long)
+
+        else:
+            # Legacy format: single prompt field
+            prompt = self._find_prompt(summary.id)
+            if prompt is None and self.strict_prompt:
+                print(f'[WARN] Strict prompt enabled but prompt not found for id {repr(summary.id)}. Using empty prompt.')
+                prompt = ""
+
+            if prompt is None and not self._missing_prompt_warned and self._prompt_map is not None:
+                print(f'[WARN] Prompt not found for id {repr(summary.id)} (prompt_jsonl provided). Continuing with empty text.')
+                self._missing_prompt_warned = True
+
+            prompt_to_encode = prompt if prompt is not None else ""
+            text_tokens = encode_prompt_text(prompt_to_encode)
+
+            data['prompt_text'] = prompt_to_encode
+            data['text_tokens'] = text_tokens
+            data['text_lengths'] = torch.tensor([len(text_tokens)], dtype=torch.long)
+
         return data
 
     def collate_fn(self, batch):
