@@ -24,11 +24,13 @@ class AntibodyDataset(BaseDataset):
             test_mode: bool = False, # extend all CDRs
             prompt_jsonl: Optional[str] = None,
             strict_prompt: Optional[bool] = None,
+            use_extended_format: Optional[bool] = False,
+            prevent_leakage: Optional[bool] = True,
         ) -> None:
         if prompt_jsonl is None:
             from .utils import default_prompt_path
             prompt_jsonl = default_prompt_path('antibody')
-        super().__init__(mmap_dir, specify_data, specify_index, prompt_jsonl, strict_prompt)
+        super().__init__(mmap_dir, specify_data, specify_index, prompt_jsonl, strict_prompt, use_extended_format, prevent_leakage)
         self.mmap_dir = mmap_dir
         # self.resampler = ClusterResampler(cluster) if cluster else None  # should only be used in training!
         self.length_type = length_type
