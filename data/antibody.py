@@ -24,8 +24,8 @@ class AntibodyDataset(BaseDataset):
             test_mode: bool = False, # extend all CDRs
             prompt_jsonl: Optional[str] = None,
             strict_prompt: Optional[bool] = None,
-            use_extended_format: Optional[bool] = False,
-            prevent_leakage: Optional[bool] = True,
+            use_extended_format: bool = False,
+            prevent_leakage: bool = False,
         ) -> None:
         if prompt_jsonl is None:
             from .utils import default_prompt_path

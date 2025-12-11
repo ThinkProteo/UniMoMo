@@ -49,8 +49,8 @@ class BaseDataset(MMAPDataset):
         # Load prompt data based on format
         if prompt_jsonl:
             if use_extended_format:
-                # Load extended format: separate prompt and answer
-                self._prompt_map, self._answer_map = load_prompt_jsonl_extended(
+                # Load extended format: separate prompt and response
+                self._prompt_map, self._response_map = load_prompt_jsonl_extended(
                     prompt_jsonl,
                     prevent_leakage=prevent_leakage,
                     leakage_marker=leakage_marker
@@ -58,10 +58,10 @@ class BaseDataset(MMAPDataset):
             else:
                 # Legacy format: single prompt field
                 self._prompt_map = load_prompt_jsonl(prompt_jsonl)
-                self._answer_map = None
+                self._response_map = None
         else:
             self._prompt_map = None
-            self._answer_map = None
+            self._response_map = None
 
         # default non-strict to avoid hard failures on missing ids
         self.strict_prompt = False if strict_prompt is None else strict_prompt
@@ -101,34 +101,34 @@ class BaseDataset(MMAPDataset):
 
         return None
 
-    def _find_answer(self, sample_id: str):
-        """Find answer (thinking + answer combined) for a sample ID."""
-        if self._answer_map is None:
+    def _find_response(self, sample_id: str):
+        """Find response (thinking + answer combined) for a sample ID."""
+        if self._response_map is None:
             return None
         sid = sample_id.strip()
 
         # Try exact match
-        if sid in self._answer_map:
-            return self._answer_map[sid]
-        if sid.lower() in self._answer_map:
-            return self._answer_map[sid.lower()]
+        if sid in self._response_map:
+            return self._response_map[sid]
+        if sid.lower() in self._response_map:
+            return self._response_map[sid.lower()]
 
         # Strip CDR suffix if present
         if '/' in sid:
             base_id, suffix = sid.rsplit('/', 1)
             if suffix in self._cdr_suffix:
-                if base_id in self._answer_map:
-                    return self._answer_map[base_id]
-                if base_id.lower() in self._answer_map:
-                    return self._answer_map[base_id.lower()]
+                if base_id in self._response_map:
+                    return self._response_map[base_id]
+                if base_id.lower() in self._response_map:
+                    return self._response_map[base_id.lower()]
             sid = base_id
 
         # Trim trailing underscores
         trimmed = sid.rstrip('_')
-        if trimmed in self._answer_map:
-            return self._answer_map[trimmed]
-        if trimmed.lower() in self._answer_map:
-            return self._answer_map[trimmed.lower()]
+        if trimmed in self._response_map:
+            return self._response_map[trimmed]
+        if trimmed.lower() in self._response_map:
+            return self._response_map[trimmed.lower()]
 
         return None
 
@@ -167,11 +167,11 @@ class BaseDataset(MMAPDataset):
 
             # Extended format fields (if use_extended_format=True):
             'prompt_text': str,  # Question only
-            'answer_text': str,  # Thinking + Answer combined
+            'response_text': str,  # Thinking + Answer combined
             'prompt_tokens': [prompt_len],  # Character codes (replaced in collate)
-            'answer_tokens': [answer_len],  # Character codes (replaced in collate)
+            'response_tokens': [response_len],  # Character codes (replaced in collate)
             'prompt_lengths': [1],
-            'answer_lengths': [1],
+            'response_lengths': [1],
         }
         '''
         cplx, summary = self.get_raw_data(idx), self.get_summary(idx)
@@ -181,17 +181,17 @@ class BaseDataset(MMAPDataset):
         data['sample_id'] = summary.id
 
         if self.use_extended_format:
-            # Extended format: separate prompt and answer
+            # Extended format: separate prompt and response
             prompt = self._find_prompt(summary.id)
-            answer = self._find_answer(summary.id)
+            response = self._find_response(summary.id)
 
             # Handle missing data
             if prompt is None and self.strict_prompt:
                 print(f'[WARN] Strict prompt enabled but prompt not found for id {repr(summary.id)}. Using empty prompt.')
                 prompt = ""
-            if answer is None and self.strict_prompt:
-                print(f'[WARN] Strict prompt enabled but answer not found for id {repr(summary.id)}. Using empty answer.')
-                answer = ""
+            if response is None and self.strict_prompt:
+                print(f'[WARN] Strict prompt enabled but response not found for id {repr(summary.id)}. Using empty response.')
+                response = ""
 
             if prompt is None and not self._missing_prompt_warned and self._prompt_map is not None:
                 print(f'[WARN] Prompt not found for id {repr(summary.id)} (prompt_jsonl provided). Continuing with empty text.')
@@ -199,19 +199,19 @@ class BaseDataset(MMAPDataset):
 
             # Ensure non-None for encoding
             prompt_to_encode = prompt if prompt is not None else ""
-            answer_to_encode = answer if answer is not None else ""
+            response_to_encode = response if response is not None else ""
 
             # Encode separately (character codes - will be replaced by BPE in collate)
             prompt_tokens = encode_prompt_text(prompt_to_encode)
-            answer_tokens = encode_prompt_text(answer_to_encode)
+            response_tokens = encode_prompt_text(response_to_encode)
 
             # Add separate fields
             data['prompt_text'] = prompt_to_encode
-            data['answer_text'] = answer_to_encode
+            data['response_text'] = response_to_encode
             data['prompt_tokens'] = prompt_tokens
-            data['answer_tokens'] = answer_tokens
+            data['response_tokens'] = response_tokens
             data['prompt_lengths'] = torch.tensor([len(prompt_tokens)], dtype=torch.long)
-            data['answer_lengths'] = torch.tensor([len(answer_tokens)], dtype=torch.long)
+            data['response_lengths'] = torch.tensor([len(response_tokens)], dtype=torch.long)
 
         else:
             # Legacy format: single prompt field
