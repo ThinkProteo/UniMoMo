@@ -205,6 +205,9 @@ class LDMMolDesign(nn.Module):
             block_lengths,  # [Nblock], number of atoms in each block
             lengths,        # [batch_size]
             is_aa,          # [Nblock], 1 for amino acid (for determining the X_mask in inverse folding)
+            text_k=None,    # Optional: [B, L_text, n_kv_heads, d_head] text key features
+            text_v=None,    # Optional: [B, L_text, n_kv_heads, d_head] text value features
+            mask_text=None, # Optional: [B, L_text] text attention mask
             sample_opt={
                 'pbar': False,
                 # 'energy_func': None,
@@ -212,6 +215,10 @@ class LDMMolDesign(nn.Module):
             },
             return_tensor=False,
         ):
+        '''
+            Sample from the diffusion model with optional text conditioning.
+            When text_k, text_v, mask_text are provided, the generation is conditioned on text embeddings.
+        '''
 
         vae_decode_n_iter = sample_opt.pop('vae_decode_n_iter', 10)
 
@@ -261,6 +268,9 @@ class LDMMolDesign(nn.Module):
             chain_ids=chain_ids,
             generate_mask=generate_mask,
             lengths=lengths,
+            text_k=text_k,
+            text_v=text_v,
+            mask_text=mask_text,
             **sample_opt
         )
         X_0, H_0 = traj[0]
