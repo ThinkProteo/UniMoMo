@@ -21,15 +21,25 @@ class PeptideDataset(BaseDataset):
             length_type: str = 'atom',
             prompt_jsonl: Optional[str] = None,
             strict_prompt: Optional[bool] = None,
+            use_extended_format: bool = False,
+            prevent_leakage: bool = False,
+            prevent_leakage_qkv_only: bool = False,
+            leakage_marker: str = '**Foldability:**',
         ) -> None:
         if prompt_jsonl is None:
             from .utils import default_prompt_path
             prompt_jsonl = default_prompt_path('peptide')
-        super().__init__(mmap_dir, specify_data, specify_index, prompt_jsonl, strict_prompt)
+        super().__init__(mmap_dir, specify_data, specify_index, prompt_jsonl, strict_prompt, use_extended_format, prevent_leakage, prevent_leakage_qkv_only, leakage_marker)
         self.mmap_dir = mmap_dir
         self.resampler = ClusterResampler(cluster) if cluster else None  # should only be used in training!
         self.length_type = length_type
 
+        # Apply filtering after parent initialization
+        # This will actually remove invalid samples from _indexes and _properties
+        self._filter_samples_by_prompt_availability()
+        
+        # Initialize dynamic_idxs after filtering
+        # _indexes and _properties now only contain valid samples
         self.dynamic_idxs = [i for i in range(len(self))]
         self.update_epoch() # should be called every epoch
 

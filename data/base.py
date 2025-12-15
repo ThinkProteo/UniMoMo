@@ -9,7 +9,7 @@ from .bioparse import Block, Complex, VOCAB, const
 from .bioparse.utils import recur_index, index_to_numerical_index, is_aa
 
 from .mmap_dataset import MMAPDataset
-from .utils import load_prompt_jsonl, load_prompt_jsonl_extended, encode_prompt_text
+from .utils import load_prompt_jsonl, load_prompt_jsonl_extended, load_prompt_jsonl_extended_dual, encode_prompt_text
 
 '''
 Base class
@@ -38,35 +38,58 @@ class BaseDataset(MMAPDataset):
             strict_prompt: Optional[bool] = None,
             use_extended_format: Optional[bool] = False,
             prevent_leakage: Optional[bool] = True,
+            prevent_leakage_qkv_only: Optional[bool] = False,
             leakage_marker: Optional[str] = '**Foldability:**',
         ) -> None:
         super().__init__(mmap_dir, specify_data, specify_index)
         self.mmap_dir = mmap_dir
         self.use_extended_format = use_extended_format
         self.prevent_leakage = prevent_leakage
+        self.prevent_leakage_qkv_only = prevent_leakage_qkv_only
         self.leakage_marker = leakage_marker
 
         # Load prompt data based on format
         if prompt_jsonl:
             if use_extended_format:
-                # Load extended format: separate prompt and response
-                self._prompt_map, self._response_map = load_prompt_jsonl_extended(
-                    prompt_jsonl,
-                    prevent_leakage=prevent_leakage,
-                    leakage_marker=leakage_marker
-                )
+                if prevent_leakage_qkv_only:
+                    # NEW: Dual response mode (different text for QKV vs SFT)
+                    self._prompt_map, self._response_qkv_map, self._response_sft_map = load_prompt_jsonl_extended_dual(
+                        prompt_jsonl,
+                        prevent_leakage_qkv_only=True,
+                        leakage_marker=leakage_marker
+                    )
+                    # For backward compatibility, set _response_map to SFT version (used in legacy paths)
+                    self._response_map = self._response_sft_map
+                else:
+                    # Original: Single response (backward compatible)
+                    self._prompt_map, self._response_map = load_prompt_jsonl_extended(
+                        prompt_jsonl,
+                        prevent_leakage=prevent_leakage,
+                        leakage_marker=leakage_marker
+                    )
+                    # In non-dual mode, both maps are the same
+                    self._response_qkv_map = self._response_map
+                    self._response_sft_map = self._response_map
             else:
                 # Legacy format: single prompt field
                 self._prompt_map = load_prompt_jsonl(prompt_jsonl)
                 self._response_map = None
+                self._response_qkv_map = None
+                self._response_sft_map = None
         else:
             self._prompt_map = None
             self._response_map = None
+            self._response_qkv_map = None
+            self._response_sft_map = None
 
         # default non-strict to avoid hard failures on missing ids
         self.strict_prompt = False if strict_prompt is None else strict_prompt
         self._missing_prompt_warned = False
         self._cdr_suffix = {'HCDR1','HCDR2','HCDR3','LCDR1','LCDR2','LCDR3'}
+        
+        # Pre-filter samples with missing prompts/responses when strict_prompt=True
+        self._valid_indices = None  # Will be set by child class after initialization
+        self._original_length = None  # Store original length before filtering
 
     def _find_prompt(self, sample_id: str):
         # try exact match
@@ -132,6 +155,152 @@ class BaseDataset(MMAPDataset):
 
         return None
 
+    def _find_response_qkv(self, sample_id: str):
+        """Find QKV response (truncated thinking) for a sample ID. Used for QKV extraction."""
+        if self._response_qkv_map is None:
+            return None
+        sid = sample_id.strip()
+
+        # Try exact match
+        if sid in self._response_qkv_map:
+            return self._response_qkv_map[sid]
+        if sid.lower() in self._response_qkv_map:
+            return self._response_qkv_map[sid.lower()]
+
+        # Strip CDR suffix if present
+        if '/' in sid:
+            base_id, suffix = sid.rsplit('/', 1)
+            if suffix in self._cdr_suffix:
+                if base_id in self._response_qkv_map:
+                    return self._response_qkv_map[base_id]
+                if base_id.lower() in self._response_qkv_map:
+                    return self._response_qkv_map[base_id.lower()]
+            sid = base_id
+
+        # Trim trailing underscores
+        trimmed = sid.rstrip('_')
+        if trimmed in self._response_qkv_map:
+            return self._response_qkv_map[trimmed]
+        if trimmed.lower() in self._response_qkv_map:
+            return self._response_qkv_map[trimmed.lower()]
+
+        return None
+
+    def _find_response_sft(self, sample_id: str):
+        """Find SFT response (full thinking + answer) for a sample ID. Used for SFT loss."""
+        if self._response_sft_map is None:
+            return None
+        sid = sample_id.strip()
+
+        # Try exact match
+        if sid in self._response_sft_map:
+            return self._response_sft_map[sid]
+        if sid.lower() in self._response_sft_map:
+            return self._response_sft_map[sid.lower()]
+
+        # Strip CDR suffix if present
+        if '/' in sid:
+            base_id, suffix = sid.rsplit('/', 1)
+            if suffix in self._cdr_suffix:
+                if base_id in self._response_sft_map:
+                    return self._response_sft_map[base_id]
+                if base_id.lower() in self._response_sft_map:
+                    return self._response_sft_map[base_id.lower()]
+            sid = base_id
+
+        # Trim trailing underscores
+        trimmed = sid.rstrip('_')
+        if trimmed in self._response_sft_map:
+            return self._response_sft_map[trimmed]
+        if trimmed.lower() in self._response_sft_map:
+            return self._response_sft_map[trimmed.lower()]
+
+        return None
+
+    def _filter_samples_by_prompt_availability(self):
+        """
+        Filter out samples where prompts/responses are missing when strict_prompt=True.
+        This method should be called by child classes after their initialization is complete.
+        """
+        if not self.strict_prompt or not self.use_extended_format:
+            # No filtering - use all indices
+            self._original_length = len(self._properties)
+            self._valid_indices = list(range(self._original_length))
+            return
+        
+        self._original_length = len(self._properties)
+        self._valid_indices = []
+        filtered_count = 0
+        filtered_samples = []  # Track first few filtered sample IDs for logging
+        
+        for idx in range(self._original_length):
+            # Get sample ID directly from _indexes to avoid calling child class methods
+            # (which may depend on attributes not yet initialized during filtering)
+            try:
+                if hasattr(self, '_indexes') and self._indexes:
+                    sample_id = self._indexes[idx][0]  # Direct access to avoid get_id() dependency
+                else:
+                    # Can't filter without index - include all
+                    self._valid_indices = list(range(self._original_length))
+                    return
+            except (IndexError, AttributeError, TypeError):
+                # Can't access index - include all
+                self._valid_indices = list(range(self._original_length))
+                return
+            
+            # Check if data exists
+            prompt_exists = self._find_prompt(sample_id) is not None
+            
+            if self.prevent_leakage_qkv_only:
+                # Dual mode: check both QKV and SFT responses
+                response_qkv_exists = self._find_response_qkv(sample_id) is not None
+                response_sft_exists = self._find_response_sft(sample_id) is not None
+                data_complete = prompt_exists and response_qkv_exists and response_sft_exists
+                
+                # Track what's missing for logging
+                if not data_complete and len(filtered_samples) < 5:
+                    missing = []
+                    if not prompt_exists: missing.append("prompt")
+                    if not response_qkv_exists: missing.append("response_qkv")
+                    if not response_sft_exists: missing.append("response_sft")
+                    filtered_samples.append(f"{sample_id} (missing: {', '.join(missing)})")
+            else:
+                # Standard mode: check single response
+                response_exists = self._find_response(sample_id) is not None
+                data_complete = prompt_exists and response_exists
+                
+                # Track what's missing for logging
+                if not data_complete and len(filtered_samples) < 5:
+                    missing = []
+                    if not prompt_exists: missing.append("prompt")
+                    if not response_exists: missing.append("response")
+                    filtered_samples.append(f"{sample_id} (missing: {', '.join(missing)})")
+            
+            if data_complete:
+                self._valid_indices.append(idx)
+            else:
+                filtered_count += 1
+        
+        # Log filtering statistics
+        if filtered_count > 0:
+            print(f"[INFO] Filtered {filtered_count}/{self._original_length} samples ({100*filtered_count/self._original_length:.1f}%) with missing prompts/responses")
+            if filtered_samples:
+                print(f"[INFO] Example filtered samples: {', '.join(filtered_samples[:3])}")
+                if filtered_count > 3:
+                    print(f"[INFO] ... and {filtered_count - 3} more")
+            
+            # Actually remove invalid samples from _indexes and _properties
+            # This ensures dataset[i] accesses the i-th valid sample directly
+            print(f"[INFO] Removing filtered samples from internal arrays...")
+            self._indexes = [self._indexes[i] for i in self._valid_indices]
+            self._properties = [self._properties[i] for i in self._valid_indices]
+            
+            # Reset valid_indices to sequential after actual filtering
+            self._valid_indices = list(range(len(self._indexes)))
+            print(f"[INFO] Dataset size after filtering: {len(self._indexes)} samples")
+        else:
+            print(f"[INFO] All {self._original_length} samples have complete prompt/response data")
+
     ########## Start of Overloading ##########
 
     def get_id(self, idx: int):
@@ -146,6 +315,7 @@ class BaseDataset(MMAPDataset):
     ########## End of Overloading ##########
 
     def get_raw_data(self, idx: int):
+        # Note: idx is already mapped by child class (e.g., through dynamic_idxs in PeptideDataset)
         cplx = Complex.from_tuple(super().__getitem__(idx))
         return cplx
     
@@ -183,35 +353,101 @@ class BaseDataset(MMAPDataset):
         if self.use_extended_format:
             # Extended format: separate prompt and response
             prompt = self._find_prompt(summary.id)
-            response = self._find_response(summary.id)
+            
+            if self.prevent_leakage_qkv_only:
+                # NEW: Dual response mode - different text for QKV vs SFT
+                response_qkv = self._find_response_qkv(summary.id)
+                response_sft = self._find_response_sft(summary.id)
+                
+                # Handle missing data
+                if self.strict_prompt:
+                    # With strict_prompt=True, samples with missing data should have been filtered out
+                    # If we encounter missing data here, it's a bug in the filtering logic
+                    if prompt is None or response_qkv is None or response_sft is None:
+                        missing = []
+                        if prompt is None: missing.append("prompt")
+                        if response_qkv is None: missing.append("response_qkv")
+                        if response_sft is None: missing.append("response_sft")
+                        raise RuntimeError(
+                            f"[ERROR] strict_prompt=True but data is missing for id {repr(summary.id)}. "
+                            f"Missing: {', '.join(missing)}. This should have been filtered during initialization. "
+                            f"This is likely a bug in the filtering logic."
+                        )
+                    prompt_to_encode = prompt
+                    response_qkv_to_encode = response_qkv
+                    response_sft_to_encode = response_sft
+                else:
+                    # With strict_prompt=False, use empty strings for missing data
+                    if prompt is None and not self._missing_prompt_warned and self._prompt_map is not None:
+                        print(f'[WARN] Prompt not found for id {repr(summary.id)}. Continuing with empty text.')
+                        self._missing_prompt_warned = True
 
-            # Handle missing data
-            if prompt is None and self.strict_prompt:
-                print(f'[WARN] Strict prompt enabled but prompt not found for id {repr(summary.id)}. Using empty prompt.')
-                prompt = ""
-            if response is None and self.strict_prompt:
-                print(f'[WARN] Strict prompt enabled but response not found for id {repr(summary.id)}. Using empty response.')
-                response = ""
+                    # Ensure non-None for encoding
+                    prompt_to_encode = prompt if prompt is not None else ""
+                    response_qkv_to_encode = response_qkv if response_qkv is not None else ""
+                    response_sft_to_encode = response_sft if response_sft is not None else ""
 
-            if prompt is None and not self._missing_prompt_warned and self._prompt_map is not None:
-                print(f'[WARN] Prompt not found for id {repr(summary.id)} (prompt_jsonl provided). Continuing with empty text.')
-                self._missing_prompt_warned = True
+                # Encode separately (character codes - will be replaced by BPE in collate)
+                prompt_tokens = encode_prompt_text(prompt_to_encode)
+                response_qkv_tokens = encode_prompt_text(response_qkv_to_encode)
+                response_sft_tokens = encode_prompt_text(response_sft_to_encode)
 
-            # Ensure non-None for encoding
-            prompt_to_encode = prompt if prompt is not None else ""
-            response_to_encode = response if response is not None else ""
+                # Add separate fields for dual mode
+                data['prompt_text'] = prompt_to_encode
+                data['response_qkv_text'] = response_qkv_to_encode  # For QKV extraction
+                data['response_sft_text'] = response_sft_to_encode  # For SFT loss
+                data['prompt_tokens'] = prompt_tokens
+                data['response_qkv_tokens'] = response_qkv_tokens
+                data['response_sft_tokens'] = response_sft_tokens
+                data['prompt_lengths'] = torch.tensor([len(prompt_tokens)], dtype=torch.long)
+                data['response_qkv_lengths'] = torch.tensor([len(response_qkv_tokens)], dtype=torch.long)
+                data['response_sft_lengths'] = torch.tensor([len(response_sft_tokens)], dtype=torch.long)
+                
+                # For backward compatibility with collate function
+                data['response_text'] = response_sft_to_encode
+                data['response_tokens'] = response_sft_tokens
+                data['response_lengths'] = torch.tensor([len(response_sft_tokens)], dtype=torch.long)
+                
+            else:
+                # Original: Single response (backward compatible)
+                response = self._find_response(summary.id)
 
-            # Encode separately (character codes - will be replaced by BPE in collate)
-            prompt_tokens = encode_prompt_text(prompt_to_encode)
-            response_tokens = encode_prompt_text(response_to_encode)
+                # Handle missing data
+                if self.strict_prompt:
+                    # With strict_prompt=True, samples with missing data should have been filtered out
+                    # If we encounter missing data here, it's a bug in the filtering logic
+                    if prompt is None or response is None:
+                        missing = []
+                        if prompt is None: missing.append("prompt")
+                        if response is None: missing.append("response")
+                        raise RuntimeError(
+                            f"[ERROR] strict_prompt=True but data is missing for id {repr(summary.id)}. "
+                            f"Missing: {', '.join(missing)}. This should have been filtered during initialization. "
+                            f"This is likely a bug in the filtering logic."
+                        )
+                    prompt_to_encode = prompt
+                    response_to_encode = response
+                else:
+                    # With strict_prompt=False, use empty strings for missing data
+                    if prompt is None and not self._missing_prompt_warned and self._prompt_map is not None:
+                        print(f'[WARN] Prompt not found for id {repr(summary.id)}. Continuing with empty text.')
+                        self._missing_prompt_warned = True
 
-            # Add separate fields
-            data['prompt_text'] = prompt_to_encode
-            data['response_text'] = response_to_encode
-            data['prompt_tokens'] = prompt_tokens
-            data['response_tokens'] = response_tokens
-            data['prompt_lengths'] = torch.tensor([len(prompt_tokens)], dtype=torch.long)
-            data['response_lengths'] = torch.tensor([len(response_tokens)], dtype=torch.long)
+                    # Ensure non-None for encoding
+                    prompt_to_encode = prompt if prompt is not None else ""
+                    response_to_encode = response if response is not None else ""
+
+                # Encode separately (character codes - will be replaced by BPE in collate)
+                prompt_tokens = encode_prompt_text(prompt_to_encode)
+                response_tokens = encode_prompt_text(response_to_encode)
+
+                # Add separate fields
+                data['prompt_text'] = prompt_to_encode
+                data['response_text'] = response_to_encode
+                data['prompt_tokens'] = prompt_tokens
+                data['response_tokens'] = response_tokens
+                data['prompt_lengths'] = torch.tensor([len(prompt_tokens)], dtype=torch.long)
+                data['response_lengths'] = torch.tensor([len(response_tokens)], dtype=torch.long)
 
         else:
             # Legacy format: single prompt field

@@ -26,16 +26,24 @@ class AntibodyDataset(BaseDataset):
             strict_prompt: Optional[bool] = None,
             use_extended_format: bool = False,
             prevent_leakage: bool = False,
+            prevent_leakage_qkv_only: bool = False,
+            leakage_marker: str = '**Foldability:**',
         ) -> None:
         if prompt_jsonl is None:
             from .utils import default_prompt_path
             prompt_jsonl = default_prompt_path('antibody')
-        super().__init__(mmap_dir, specify_data, specify_index, prompt_jsonl, strict_prompt, use_extended_format, prevent_leakage)
+        super().__init__(mmap_dir, specify_data, specify_index, prompt_jsonl, strict_prompt, use_extended_format, prevent_leakage, prevent_leakage_qkv_only, leakage_marker)
         self.mmap_dir = mmap_dir
         # self.resampler = ClusterResampler(cluster) if cluster else None  # should only be used in training!
         self.length_type = length_type
         self.test_mode = test_mode
 
+        # Apply filtering after parent initialization
+        # This will actually remove invalid samples from _indexes and _properties
+        self._filter_samples_by_prompt_availability()
+        
+        # Build idx_tup from the already-filtered _properties
+        # After filtering, _properties only contains valid samples
         self.idx_tup = []
         if test_mode:       
             for idx, prop in enumerate(self._properties):

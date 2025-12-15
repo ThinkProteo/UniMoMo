@@ -169,8 +169,8 @@ class DynamicBatchWrapper(torch.utils.data.Dataset):
     def _form_batch(self):
 
         np.random.shuffle(self.indexes)
-        last_batch_indexes = self.batch_indexes
         self.batch_indexes = []
+        oversized_samples = []  # Track samples that exceed ubound_per_batch
 
         cur_complexity = 0
         batch = []
@@ -185,9 +185,21 @@ class DynamicBatchWrapper(torch.utils.data.Dataset):
             for idx in tqdm(range(len(iterator)), ascii=True):
                 i = iterator.prefecth(idx)
                 n = self.dataset.get_len(i)
+                
+                # ✅ FIX: Don't drop oversized samples - put them in single-sample batches
                 if self.eval_func(n) > self.ubound_per_batch:
-                    i = iterator[idx] # record visited
+                    i = iterator[idx]  # record visited
+                    oversized_samples.append(i)
+                    # Save current batch if not empty
+                    if len(batch) > 0:
+                        self.batch_indexes.append(batch)
+                        iterator.done_batch()
+                        batch = []
+                    # Put oversized sample in its own batch
+                    self.batch_indexes.append([i])
+                    batch_max_n = 0
                     continue
+                
                 batch_max_n = max(batch_max_n, n)
                 cur_complexity = self.eval_func(batch_max_n) * len(batch)
                 if cur_complexity > self.ubound_per_batch:
@@ -198,14 +210,26 @@ class DynamicBatchWrapper(torch.utils.data.Dataset):
                     batch = []
                     batch_max_n = n # for next batch
                 batch.append(i)
-            self.batch_indexes.append(batch)    # last batch
+            if len(batch) > 0:  # Don't forget last batch
+                self.batch_indexes.append(batch)
 
         elif self.n_use_max_in_dataset:
             batch_max_n = 0
             for i in tqdm(self.indexes, ascii=True):
                 n = self.dataset.get_len(i)
+                
+                # ✅ FIX: Don't drop oversized samples - put them in single-sample batches
                 if self.eval_func(n) > self.ubound_per_batch:
+                    oversized_samples.append(i)
+                    # Save current batch if not empty
+                    if len(batch) > 0:
+                        self.batch_indexes.append(batch)
+                        batch = []
+                        batch_max_n = 0
+                    # Put oversized sample in its own batch
+                    self.batch_indexes.append([i])
                     continue
+                
                 batch_max_n = max(batch_max_n, n)
                 cur_complexity = self.eval_func(batch_max_n) * len(batch)
                 if cur_complexity > self.ubound_per_batch:
@@ -213,29 +237,68 @@ class DynamicBatchWrapper(torch.utils.data.Dataset):
                     batch = []
                     batch_max_n = n # for next batch
                 batch.append(i)
-            self.batch_indexes.append(batch)    # last batch
+            if len(batch) > 0:  # Don't forget last batch
+                self.batch_indexes.append(batch)
         else:
             for i in tqdm(self.indexes, ascii=True):
                 item_len = self.eval_func(self.dataset.get_len(i))
+                
+                # ✅ FIX: Don't drop oversized samples - put them in single-sample batches
                 if item_len > self.ubound_per_batch:
+                    oversized_samples.append(i)
+                    # Save current batch if not empty
+                    if len(batch) > 0:
+                        self.batch_indexes.append(batch)
+                        batch = []
+                        cur_complexity = 0
+                    # Put oversized sample in its own batch
+                    self.batch_indexes.append([i])
                     continue
+                
                 cur_complexity += item_len
                 if cur_complexity > self.ubound_per_batch:
                     self.batch_indexes.append(batch)
                     batch = []
                     cur_complexity = item_len
                 batch.append(i)
-            self.batch_indexes.append(batch)    # last batch
+            if len(batch) > 0:  # Don't forget last batch
+                self.batch_indexes.append(batch)
 
+        # ✅ Log oversized samples for transparency
+        if len(oversized_samples) > 0:
+            total_samples = len(self.indexes)
+            oversized_pct = 100.0 * len(oversized_samples) / total_samples
+            print(f"\n⚠️  DynamicBatchWrapper: {len(oversized_samples)}/{total_samples} samples ({oversized_pct:.1f}%) exceed ubound_per_batch={self.ubound_per_batch}")
+            print(f"    These samples will be processed individually (batch_size=1)")
+            print(f"    Total batches created: {len(self.batch_indexes)}")
+            
+            # Show statistics about oversized samples
+            oversized_lengths = [self.dataset.get_len(i) for i in oversized_samples[:10]]
+            if len(oversized_lengths) > 0:
+                print(f"    Example oversized sample lengths: {oversized_lengths[:5]}")
+                max_len = max([self.dataset.get_len(i) for i in oversized_samples])
+                print(f"    Largest sample has length {max_len} (complexity: {self.eval_func(max_len):.0f})")
+        
+        # ✅ Size stabilization for DistributedSampler compatibility
+        # PyTorch's DistributedSampler requires dataset size to be constant across epochs
         if self.total_size is None:
+            # First epoch: record the target size
             self.total_size = len(self.batch_indexes)
+            print(f"    Dataset size locked at {self.total_size} batches for distributed training")
         else:
-            # control the lengths of the dataset, otherwise the dataloader will raise error
-            if len(self.batch_indexes) < self.total_size:
-                num_add = self.total_size - len(self.batch_indexes)
-                self.batch_indexes = self.batch_indexes + last_batch_indexes[:num_add]
-            else:
+            # Subsequent epochs: adjust to match the target size
+            current_size = len(self.batch_indexes)
+            if current_size < self.total_size:
+                # Need more batches: randomly sample from existing batches to pad
+                num_add = self.total_size - current_size
+                # Randomly sample batches to duplicate (better than using old batches)
+                padding_batches = [self.batch_indexes[i % current_size] for i in range(num_add)]
+                self.batch_indexes.extend(padding_batches)
+                print(f"    Padded {num_add} batches to maintain size={self.total_size} for DistributedSampler")
+            elif current_size > self.total_size:
+                # Too many batches: truncate to target size
                 self.batch_indexes = self.batch_indexes[:self.total_size]
+                print(f"    Truncated to {self.total_size} batches for DistributedSampler")
 
     def __len__(self):
         return len(self.batch_indexes)

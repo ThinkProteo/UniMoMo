@@ -107,6 +107,110 @@ def load_prompt_jsonl_extended(
     return prompt_map, response_map
 
 
+def load_prompt_jsonl_extended_dual(
+    path: str,
+    id_key: str = 'complex_id',
+    prompt_key: str = 'question',
+    thinking_key: str = 'thinking',
+    response_key: str = 'answer',
+    prevent_leakage_qkv_only: bool = False,
+    leakage_marker: str = '**Foldability:**'
+) -> tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    """
+    Load extended JSONL with TWO response versions for separate QKV and SFT processing.
+
+    This mode allows:
+    - QKV extraction: Use truncated thinking (no answer leakage)
+    - SFT loss: Use full thinking + answer (supervise on complete reasoning)
+
+    Args:
+        path: Path to JSONL file
+        id_key: Key for sample ID (default: 'complex_id')
+        prompt_key: Key for prompt text (default: 'question')
+        thinking_key: Key for CoT thinking (default: 'thinking')
+        response_key: Key for response text (default: 'answer')
+        prevent_leakage_qkv_only: If True, return dual responses (truncated for QKV, full for SFT)
+        leakage_marker: Marker indicating start of answer content in thinking (default: '**Foldability:**')
+
+    Returns:
+        (prompt_map, response_qkv_map, response_sft_map): Three dicts mapping sample_id -> text
+            - prompt_map: Question text
+            - response_qkv_map: Thinking truncated at marker (for QKV extraction)
+            - response_sft_map: Full thinking + answer (for SFT loss)
+            
+        If prevent_leakage_qkv_only=False, response_qkv_map == response_sft_map (backward compatible)
+    """
+    prompt_map: Dict[str, str] = {}
+    response_qkv_map: Dict[str, str] = {}
+    response_sft_map: Dict[str, str] = {}
+
+    if path is None:
+        return prompt_map, response_qkv_map, response_sft_map
+
+    with open(path, 'r') as fin:
+        for line in fin:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+
+            # ID is required
+            if id_key not in record:
+                continue
+
+            _id = str(record[id_key]).strip()
+
+            # Extract prompt (question)
+            _prompt = record.get(prompt_key, "")
+            if _prompt:
+                prompt_map[_id] = _prompt
+                prompt_map[_id.lower()] = _prompt
+
+            # Extract thinking and answer
+            _thinking = record.get(thinking_key, "")
+            _answer = record.get(response_key, "")
+
+            if prevent_leakage_qkv_only:
+                # NEW MODE: Dual response versions
+                
+                # 1. QKV version: Truncated thinking (no answer leakage)
+                _thinking_truncated = _thinking
+                if _thinking and leakage_marker in _thinking:
+                    _thinking_truncated = _thinking.split(leakage_marker)[0].strip()
+                
+                if _thinking_truncated:
+                    response_qkv_map[_id] = _thinking_truncated
+                    response_qkv_map[_id.lower()] = _thinking_truncated
+                
+                # 2. SFT version: Full thinking + answer
+                response_parts = []
+                if _thinking:
+                    response_parts.append(_thinking)
+                if _answer:
+                    response_parts.append(_answer)
+                
+                if response_parts:
+                    combined_response = "\n\n".join(response_parts)
+                    response_sft_map[_id] = combined_response
+                    response_sft_map[_id.lower()] = combined_response
+            else:
+                # BACKWARD COMPATIBLE: Same response for both QKV and SFT
+                # Combine full thinking + answer
+                response_parts = []
+                if _thinking:
+                    response_parts.append(_thinking)
+                if _answer:
+                    response_parts.append(_answer)
+                
+                if response_parts:
+                    combined_response = "\n\n".join(response_parts)
+                    response_qkv_map[_id] = combined_response
+                    response_qkv_map[_id.lower()] = combined_response
+                    response_sft_map[_id] = combined_response
+                    response_sft_map[_id.lower()] = combined_response
+
+    return prompt_map, response_qkv_map, response_sft_map
+
+
 def encode_prompt_text(prompt: Optional[str]) -> torch.Tensor:
     if prompt is None:
         return torch.empty(0, dtype=torch.long)
