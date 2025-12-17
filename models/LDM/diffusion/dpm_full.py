@@ -244,6 +244,9 @@ class FullDPM(nn.Module):
             lengths,
             pbar=False,
             ispred_x=None, # Defaults to None to use self.ispred_x
+            text_k=None,    # Optional: text key features for conditioning
+            text_v=None,    # Optional: text value features for conditioning
+            mask_text=None, # Optional: text attention mask
         ):
         
         # Use instance configuration if not overridden
@@ -274,7 +277,8 @@ class FullDPM(nn.Module):
 
             # Network prediction
             model_out_H, model_out_X = self.eps_net(
-                H_t, X_t, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta
+                H_t, X_t, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta,
+                text_k=text_k, text_v=text_v, mask_text=mask_text
             )
 
             if ispred_x:
