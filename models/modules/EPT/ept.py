@@ -624,22 +624,17 @@ class EPTAttentionMoT(nn.Module):
         if self.use_flash_attn:
             # Flash Attention path using PyTorch's scaled_dot_product_attention
             # This automatically dispatches to Flash Attention kernel when possible
-            try:
-                out = F.scaled_dot_product_attention(
-                    query=q,              # [B, n_q, N_vae, d_qk_head]
-                    key=k,                # [B, n_q, L_total, d_qk_head]
-                    value=v,              # [B, n_q, L_total, 4*d_head]
-                    attn_mask=bias_full,  # [B, n_q, N_vae, L_total]
-                    dropout_p=0.0,
-                    is_causal=False,
-                    scale=self.scale_factor,
-                )  # [B, n_q, N_vae, 4*d_head]
-            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                # Fallback to vanilla attention if Flash Attention fails
-                print(f"[EPTAttentionMoT] Flash Attention failed ({type(e).__name__}), falling back to vanilla attention")
-                attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k)  # [B, n_q, N_vae, L_total]
-                attn = F.softmax(attn_scores * self.scale_factor + bias_full, dim=-1)
-                out = torch.einsum('bhqk,bhkd->bhqd', attn, v)  # [B, n_q, N_vae, 4*d_head]
+            # NOTE: No fallback - if Flash Attention fails, we fail loudly to avoid DDP deadlocks
+            # (different ranks taking different code paths causes collective mismatch)
+            out = F.scaled_dot_product_attention(
+                query=q,              # [B, n_q, N_vae, d_qk_head]
+                key=k,                # [B, n_q, L_total, d_qk_head]
+                value=v,              # [B, n_q, L_total, 4*d_head]
+                attn_mask=bias_full,  # [B, n_q, N_vae, L_total]
+                dropout_p=0.0,
+                is_causal=False,
+                scale=self.scale_factor,
+            )  # [B, n_q, N_vae, 4*d_head]
         else:
             # Vanilla attention path (original implementation)
             # Scaling: self.scale_factor is 0.5/sqrt(d_head).
