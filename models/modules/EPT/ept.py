@@ -393,8 +393,7 @@ class EPTLayerMoT(nn.Module):
         efficient=False,
         vector_act="none",
         attn_bias=True,
-        num_kv_groups=4,
-        use_flash_attn=True,
+        num_kv_groups=4
     ):
         super(EPTLayerMoT, self).__init__()
         self.attn_layer = SubLayerWrapper(
@@ -409,7 +408,6 @@ class EPTLayerMoT(nn.Module):
                 vector_act=vector_act,
                 attn_bias=attn_bias,
                 num_kv_groups=num_kv_groups,
-                use_flash_attn=use_flash_attn,
             ),
             d_hidden,
             layer_norm,
@@ -467,7 +465,6 @@ class EPTAttentionMoT(nn.Module):
         attn_bias: bool = True,
         qk_norm: bool = False,
         num_kv_groups: int = 4,
-        use_flash_attn: bool = True,
     ):
         super().__init__()
 
@@ -522,9 +519,6 @@ class EPTAttentionMoT(nn.Module):
         else:
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
-
-        # Flash Attention flag
-        self.use_flash_attn = use_flash_attn
 
     def forward(
         self,
@@ -618,8 +612,9 @@ class EPTAttentionMoT(nn.Module):
         combined_mask = torch.cat([mask_text, H_mask], dim=1)
         bias_full = bias_full.masked_fill(~combined_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
 
-        # Compute attention
+        # Compute attention (vanilla implementation)
         # d is now d_qk_head (4*d_head)
+<<<<<<< Updated upstream
 
         if self.use_flash_attn:
             # Flash Attention path using PyTorch's scaled_dot_product_attention
@@ -644,6 +639,12 @@ class EPTAttentionMoT(nn.Module):
             attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k)  # [B, n_q, N_vae, L_total]
             attn = F.softmax(attn_scores * self.scale_factor + bias_full, dim=-1)
             out = torch.einsum('bhqk,bhkd->bhqd', attn, v)  # [B, n_q, N_vae, 4*d_head]
+=======
+        # Scaling: self.scale_factor is 0.5/sqrt(d_head), matching original EPT behavior.
+        attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k)  # [B, n_q, N_vae, L_total]
+        attn = F.softmax(attn_scores * self.scale_factor + bias_full, dim=-1)
+        out = torch.einsum('bhqk,bhkd->bhqd', attn, v)  # [B, n_q, N_vae, 4*d_head]
+>>>>>>> Stashed changes
 
         # Reshape output: [B, n_q, N_vae, 4*d_head] -> [B, N_vae, n_q, 4*d_head]
         out = out.transpose(1, 2)
@@ -689,7 +690,6 @@ class XTransEncoderActMoT(nn.Module):
         efficient=False,
         vector_act="none",
         num_kv_groups=4,
-        use_flash_attn=True,
     ) -> None:
         super().__init__()
 
@@ -709,7 +709,6 @@ class XTransEncoderActMoT(nn.Module):
             efficient=efficient,
             vector_act=vector_act,
             num_kv_groups=num_kv_groups,
-            use_flash_attn=use_flash_attn,
         )
 
     def forward(
@@ -789,7 +788,6 @@ class TransformerMoT(nn.Module):
         efficient=False,
         vector_act="none",
         num_kv_groups=4,
-        use_flash_attn=True,
     ):
         super().__init__()
 
@@ -801,7 +799,6 @@ class TransformerMoT(nn.Module):
         self.efficient = efficient
         self._local_mask = local_mask
         self.num_kv_groups = num_kv_groups
-        self.use_flash_attn = use_flash_attn
         if self.efficient and not xformers_enable:
             print(
                 "xformers are not downloaded, change into custom attention mechanism. "
@@ -853,7 +850,6 @@ class TransformerMoT(nn.Module):
                     vector_act,
                     attn_bias,
                     num_kv_groups,
-                    use_flash_attn=self.use_flash_attn,
                 ),
             )
 
