@@ -195,9 +195,11 @@ class EPTAttentionMoT(nn.Module):
         if qk_norm:
             self.q_norm = nn.LayerNorm(self.d_qk_head)
             self.k_norm = nn.LayerNorm(self.d_qk_head)
+            self.text_k_norm = nn.LayerNorm(self.d_qk_head)
         else:
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
+            self.text_k_norm = nn.Indentity()
 
     def forward(
         self,
@@ -243,7 +245,7 @@ class EPTAttentionMoT(nn.Module):
         # Apply Q/K normalization
         H_q_vae = self.q_norm(H_q_vae)
         H_k_vae = self.k_norm(H_k_vae)
-        text_k = self.k_norm(text_k)
+        text_k = self.text_k_norm(text_k)
 
         # ========== BATCHED ATTENTION ==========
 
