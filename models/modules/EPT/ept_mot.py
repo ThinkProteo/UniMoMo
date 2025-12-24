@@ -184,7 +184,8 @@ class EPTAttentionMoT(nn.Module):
         self.vector_v = nn.Linear(d_hidden, self.n_kv_heads * self.d_head, bias=False)
 
         # Text Key projection: d_head -> 4*d_head to match VAE K dimension
-        self.text_k_proj = nn.Linear(self.d_head, self.d_qk_head, bias=False)
+        # diffusion match to text; not the other way around!!
+        # self.text_k_proj = nn.Linear(self.d_head, self.d_qk_head, bias=False)
 
         # Output projections
         self.scaler_o = nn.Linear(self.n_q_heads * self.d_head, d_hidden)
@@ -222,9 +223,6 @@ class EPTAttentionMoT(nn.Module):
             assert text_k.shape[0] == B, "Batch size mismatch"
             L_text_max = text_k.shape[1]
             
-            # Project Text Keys: d_head -> 4*d_head (d_qk_head)
-            text_k_proj = self.text_k_proj(text_k)
-            
             if mask_text is None:
                 mask_text = torch.ones(B, L_text_max, dtype=torch.bool, device=device)
 
@@ -242,20 +240,16 @@ class EPTAttentionMoT(nn.Module):
         # Concatenate scalar + vector for VAE values: [B, N, n_kv_heads, 4*d_head]
         V_attn_vae = torch.cat([H_v_vae, V_v_vae], dim=-1)
 
-        # Text Values: pad vector part with zeros (text has no 3D vector channel)
-        V_v_text_zeros = torch.zeros(B, L_text_max, self.n_kv_heads, 3 * self.d_head, device=device, dtype=H.dtype)
-        V_attn_text = torch.cat([text_v, V_v_text_zeros], dim=-1)
-
         # Apply Q/K normalization
         H_q_vae = self.q_norm(H_q_vae)
         H_k_vae = self.k_norm(H_k_vae)
-        text_k_proj = self.k_norm(text_k_proj)
+        text_k = self.k_norm(text_k)
 
         # ========== BATCHED ATTENTION ==========
 
         # Concatenate text and VAE K/V along sequence dimension
-        K_full = torch.cat([text_k_proj, H_k_vae], dim=1)  # [B, L_total, n_kv, d_qk_head]
-        V_full = torch.cat([V_attn_text, V_attn_vae], dim=1)  # [B, L_total, n_kv, 4*d_head]
+        K_full = torch.cat([text_k, H_k_vae], dim=1)  # [B, L_total, n_kv, d_qk_head]
+        V_full = torch.cat([text_v, V_attn_vae], dim=1)  # [B, L_total, n_kv, 4*d_head]
         L_total = L_text_max + N_vae_max
 
         # Reshape for multi-head attention: [B, n_heads, L, d]

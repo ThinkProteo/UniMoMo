@@ -9,7 +9,7 @@ from .bioparse import Block, Complex, VOCAB, const
 from .bioparse.utils import recur_index, index_to_numerical_index, is_aa
 
 from .mmap_dataset import MMAPDataset
-from .utils import load_prompt_jsonl, load_prompt_jsonl_extended, load_prompt_jsonl_extended_dual, encode_prompt_text
+from .utils import load_prompt_jsonl, load_prompt_jsonl_extended, load_prompt_jsonl_extended_dual
 
 '''
 Base class
@@ -156,7 +156,7 @@ class BaseDataset(MMAPDataset):
 
     def _find_raw_text(self, sample_id: str):
         return self._find(self._raw_text_map, sample_id)
-        
+
     def _filter_samples_by_prompt_availability(self):
         """
         Filter out samples where prompts/responses are missing when strict_prompt=True.

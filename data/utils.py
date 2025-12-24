@@ -213,8 +213,3 @@ def load_prompt_jsonl_extended_dual(
 
     return prompt_map, response_qkv_map, response_sft_map, raw_text_map
 
-
-def encode_prompt_text(prompt: Optional[str]) -> torch.Tensor:
-    if prompt is None:
-        return torch.empty(0, dtype=torch.long)
-    return torch.tensor([ord(c) for c in prompt], dtype=torch.long)
