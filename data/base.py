@@ -53,7 +53,7 @@ class BaseDataset(MMAPDataset):
             if use_extended_format:
                 if prevent_leakage_qkv_only:
                     # NEW: Dual response mode (different text for QKV vs SFT)
-                    self._prompt_map, self._response_qkv_map, self._response_sft_map = load_prompt_jsonl_extended_dual(
+                    self._prompt_map, self._response_qkv_map, self._response_sft_map, self._raw_text_map = load_prompt_jsonl_extended_dual(
                         prompt_jsonl,
                         prevent_leakage_qkv_only=True,
                         leakage_marker=leakage_marker
@@ -91,132 +91,72 @@ class BaseDataset(MMAPDataset):
         self._valid_indices = None  # Will be set by child class after initialization
         self._original_length = None  # Store original length before filtering
 
-    def _find_prompt(self, sample_id: str):
-        # try exact match
-        if self._prompt_map is None:
+    def _find(self, mapping: dict, sample_id: str):
+        """
+        Generic lookup function with fuzzy matching.
+        
+        Tries multiple strategies:
+        1. Exact match
+        2. Case-insensitive match
+        3. Strip CDR suffix (e.g., 4fqv_BA_H_L/HCDR3 -> 4fqv_BA_H_L)
+        4. Trim trailing underscores
+        
+        Args:
+            mapping: Dictionary to search in
+            sample_id: ID to look up
+            
+        Returns:
+            Value from mapping or None if not found
+        """
+        if mapping is None:
             return None
+        
         sid = sample_id.strip()
-        # DEBUG: Print lookup attempt
-        # print(f"Looking up prompt for: '{sid}'")
 
-        if sid in self._prompt_map:
-            return self._prompt_map[sid]
-        if sid.lower() in self._prompt_map:
-            return self._prompt_map[sid.lower()]
+        # Try exact match
+        if sid in mapping:
+            return mapping[sid]
+        if sid.lower() in mapping:
+            return mapping[sid.lower()]
 
-        # strip CDR suffix if present (e.g. 4fqv_BA_H_L/HCDR3 -> 4fqv_BA_H_L)
+        # Strip CDR suffix if present (e.g., 4fqv_BA_H_L/HCDR3 -> 4fqv_BA_H_L)
         if '/' in sid:
             base_id, suffix = sid.rsplit('/', 1)
             if suffix in self._cdr_suffix:
-                if base_id in self._prompt_map:
-                    return self._prompt_map[base_id]
-                if base_id.lower() in self._prompt_map:
-                    return self._prompt_map[base_id.lower()]
-            # Fallback: try looking up the full ID anyway in case the map has the suffix
+                if base_id in mapping:
+                    return mapping[base_id]
+                if base_id.lower() in mapping:
+                    return mapping[base_id.lower()]
             sid = base_id
 
-        # trim trailing underscores if any
+        # Trim trailing underscores
         trimmed = sid.rstrip('_')
-        if trimmed in self._prompt_map:
-            return self._prompt_map[trimmed]
-        if trimmed.lower() in self._prompt_map:
-            return self._prompt_map[trimmed.lower()]
+        if trimmed in mapping:
+            return mapping[trimmed]
+        if trimmed.lower() in mapping:
+            return mapping[trimmed.lower()]
 
         return None
+
+    def _find_prompt(self, sample_id: str):
+        """Find prompt text for a sample ID."""
+        return self._find(self._prompt_map, sample_id)
 
     def _find_response(self, sample_id: str):
         """Find response (thinking + answer combined) for a sample ID."""
-        if self._response_map is None:
-            return None
-        sid = sample_id.strip()
-
-        # Try exact match
-        if sid in self._response_map:
-            return self._response_map[sid]
-        if sid.lower() in self._response_map:
-            return self._response_map[sid.lower()]
-
-        # Strip CDR suffix if present
-        if '/' in sid:
-            base_id, suffix = sid.rsplit('/', 1)
-            if suffix in self._cdr_suffix:
-                if base_id in self._response_map:
-                    return self._response_map[base_id]
-                if base_id.lower() in self._response_map:
-                    return self._response_map[base_id.lower()]
-            sid = base_id
-
-        # Trim trailing underscores
-        trimmed = sid.rstrip('_')
-        if trimmed in self._response_map:
-            return self._response_map[trimmed]
-        if trimmed.lower() in self._response_map:
-            return self._response_map[trimmed.lower()]
-
-        return None
+        return self._find(self._response_map, sample_id)
 
     def _find_response_qkv(self, sample_id: str):
         """Find QKV response (truncated thinking) for a sample ID. Used for QKV extraction."""
-        if self._response_qkv_map is None:
-            return None
-        sid = sample_id.strip()
-
-        # Try exact match
-        if sid in self._response_qkv_map:
-            return self._response_qkv_map[sid]
-        if sid.lower() in self._response_qkv_map:
-            return self._response_qkv_map[sid.lower()]
-
-        # Strip CDR suffix if present
-        if '/' in sid:
-            base_id, suffix = sid.rsplit('/', 1)
-            if suffix in self._cdr_suffix:
-                if base_id in self._response_qkv_map:
-                    return self._response_qkv_map[base_id]
-                if base_id.lower() in self._response_qkv_map:
-                    return self._response_qkv_map[base_id.lower()]
-            sid = base_id
-
-        # Trim trailing underscores
-        trimmed = sid.rstrip('_')
-        if trimmed in self._response_qkv_map:
-            return self._response_qkv_map[trimmed]
-        if trimmed.lower() in self._response_qkv_map:
-            return self._response_qkv_map[trimmed.lower()]
-
-        return None
+        return self._find(self._response_qkv_map, sample_id)
 
     def _find_response_sft(self, sample_id: str):
         """Find SFT response (full thinking + answer) for a sample ID. Used for SFT loss."""
-        if self._response_sft_map is None:
-            return None
-        sid = sample_id.strip()
+        return self._find(self._response_sft_map, sample_id)
 
-        # Try exact match
-        if sid in self._response_sft_map:
-            return self._response_sft_map[sid]
-        if sid.lower() in self._response_sft_map:
-            return self._response_sft_map[sid.lower()]
-
-        # Strip CDR suffix if present
-        if '/' in sid:
-            base_id, suffix = sid.rsplit('/', 1)
-            if suffix in self._cdr_suffix:
-                if base_id in self._response_sft_map:
-                    return self._response_sft_map[base_id]
-                if base_id.lower() in self._response_sft_map:
-                    return self._response_sft_map[base_id.lower()]
-            sid = base_id
-
-        # Trim trailing underscores
-        trimmed = sid.rstrip('_')
-        if trimmed in self._response_sft_map:
-            return self._response_sft_map[trimmed]
-        if trimmed.lower() in self._response_sft_map:
-            return self._response_sft_map[trimmed.lower()]
-
-        return None
-
+    def _find_raw_text(self, sample_id: str):
+        return self._find(self._raw_text_map, sample_id)
+        
     def _filter_samples_by_prompt_availability(self):
         """
         Filter out samples where prompts/responses are missing when strict_prompt=True.
@@ -352,120 +292,10 @@ class BaseDataset(MMAPDataset):
 
         if self.use_extended_format:
             # Extended format: separate prompt and response
-            prompt = self._find_prompt(summary.id)
-            
-            if self.prevent_leakage_qkv_only:
-                # NEW: Dual response mode - different text for QKV vs SFT
-                response_qkv = self._find_response_qkv(summary.id)
-                response_sft = self._find_response_sft(summary.id)
-                
-                # Handle missing data
-                if self.strict_prompt:
-                    # With strict_prompt=True, samples with missing data should have been filtered out
-                    # If we encounter missing data here, it's a bug in the filtering logic
-                    if prompt is None or response_qkv is None or response_sft is None:
-                        missing = []
-                        if prompt is None: missing.append("prompt")
-                        if response_qkv is None: missing.append("response_qkv")
-                        if response_sft is None: missing.append("response_sft")
-                        raise RuntimeError(
-                            f"[ERROR] strict_prompt=True but data is missing for id {repr(summary.id)}. "
-                            f"Missing: {', '.join(missing)}. This should have been filtered during initialization. "
-                            f"This is likely a bug in the filtering logic."
-                        )
-                    prompt_to_encode = prompt
-                    response_qkv_to_encode = response_qkv
-                    response_sft_to_encode = response_sft
-                else:
-                    # With strict_prompt=False, use empty strings for missing data
-                    if prompt is None and not self._missing_prompt_warned and self._prompt_map is not None:
-                        print(f'[WARN] Prompt not found for id {repr(summary.id)}. Continuing with empty text.')
-                        self._missing_prompt_warned = True
-
-                    # Ensure non-None for encoding
-                    prompt_to_encode = prompt if prompt is not None else ""
-                    response_qkv_to_encode = response_qkv if response_qkv is not None else ""
-                    response_sft_to_encode = response_sft if response_sft is not None else ""
-
-                # Encode separately (character codes - will be replaced by BPE in collate)
-                prompt_tokens = encode_prompt_text(prompt_to_encode)
-                response_qkv_tokens = encode_prompt_text(response_qkv_to_encode)
-                response_sft_tokens = encode_prompt_text(response_sft_to_encode)
-
-                # Add separate fields for dual mode
-                data['prompt_text'] = prompt_to_encode
-                data['response_qkv_text'] = response_qkv_to_encode  # For QKV extraction
-                data['response_sft_text'] = response_sft_to_encode  # For SFT loss
-                data['prompt_tokens'] = prompt_tokens
-                data['response_qkv_tokens'] = response_qkv_tokens
-                data['response_sft_tokens'] = response_sft_tokens
-                data['prompt_lengths'] = torch.tensor([len(prompt_tokens)], dtype=torch.long)
-                data['response_qkv_lengths'] = torch.tensor([len(response_qkv_tokens)], dtype=torch.long)
-                data['response_sft_lengths'] = torch.tensor([len(response_sft_tokens)], dtype=torch.long)
-                
-                # For backward compatibility with collate function
-                data['response_text'] = response_sft_to_encode
-                data['response_tokens'] = response_sft_tokens
-                data['response_lengths'] = torch.tensor([len(response_sft_tokens)], dtype=torch.long)
-                
-            else:
-                # Original: Single response (backward compatible)
-                response = self._find_response(summary.id)
-
-                # Handle missing data
-                if self.strict_prompt:
-                    # With strict_prompt=True, samples with missing data should have been filtered out
-                    # If we encounter missing data here, it's a bug in the filtering logic
-                    if prompt is None or response is None:
-                        missing = []
-                        if prompt is None: missing.append("prompt")
-                        if response is None: missing.append("response")
-                        raise RuntimeError(
-                            f"[ERROR] strict_prompt=True but data is missing for id {repr(summary.id)}. "
-                            f"Missing: {', '.join(missing)}. This should have been filtered during initialization. "
-                            f"This is likely a bug in the filtering logic."
-                        )
-                    prompt_to_encode = prompt
-                    response_to_encode = response
-                else:
-                    # With strict_prompt=False, use empty strings for missing data
-                    if prompt is None and not self._missing_prompt_warned and self._prompt_map is not None:
-                        print(f'[WARN] Prompt not found for id {repr(summary.id)}. Continuing with empty text.')
-                        self._missing_prompt_warned = True
-
-                    # Ensure non-None for encoding
-                    prompt_to_encode = prompt if prompt is not None else ""
-                    response_to_encode = response if response is not None else ""
-
-                # Encode separately (character codes - will be replaced by BPE in collate)
-                prompt_tokens = encode_prompt_text(prompt_to_encode)
-                response_tokens = encode_prompt_text(response_to_encode)
-
-                # Add separate fields
-                data['prompt_text'] = prompt_to_encode
-                data['response_text'] = response_to_encode
-                data['prompt_tokens'] = prompt_tokens
-                data['response_tokens'] = response_tokens
-                data['prompt_lengths'] = torch.tensor([len(prompt_tokens)], dtype=torch.long)
-                data['response_lengths'] = torch.tensor([len(response_tokens)], dtype=torch.long)
-
-        else:
-            # Legacy format: single prompt field
-            prompt = self._find_prompt(summary.id)
-            if prompt is None and self.strict_prompt:
-                print(f'[WARN] Strict prompt enabled but prompt not found for id {repr(summary.id)}. Using empty prompt.')
-                prompt = ""
-
-            if prompt is None and not self._missing_prompt_warned and self._prompt_map is not None:
-                print(f'[WARN] Prompt not found for id {repr(summary.id)} (prompt_jsonl provided). Continuing with empty text.')
-                self._missing_prompt_warned = True
-
-            prompt_to_encode = prompt if prompt is not None else ""
-            text_tokens = encode_prompt_text(prompt_to_encode)
-
-            data['prompt_text'] = prompt_to_encode
-            data['text_tokens'] = text_tokens
-            data['text_lengths'] = torch.tensor([len(text_tokens)], dtype=torch.long)
+            data['prompt_text'] = self._find_prompt(summary.id)
+            data['response_qkv_text'] = self._find_response_qkv(summary.id)
+            data['response_sft_text'] = self._find_response_sft(summary.id)
+            data['raw_text'] = self._find_raw_text(summary.id)
 
         return data
 

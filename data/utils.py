@@ -143,6 +143,7 @@ def load_prompt_jsonl_extended_dual(
     prompt_map: Dict[str, str] = {}
     response_qkv_map: Dict[str, str] = {}
     response_sft_map: Dict[str, str] = {}
+    raw_text_map: Dict[str, str] = {}
 
     if path is None:
         return prompt_map, response_qkv_map, response_sft_map
@@ -171,10 +172,12 @@ def load_prompt_jsonl_extended_dual(
 
             if prevent_leakage_qkv_only:
                 # NEW MODE: Dual response versions
+                raw_text_map[_id] = record
+                raw_text_map[_id.lower()] = record
                 
                 # 1. QKV version: Truncated thinking (no answer leakage)
                 _thinking_truncated = _thinking
-                if _thinking and leakage_marker in _thinking:
+                if _thinking and leakage_marker in _thinking: #Erran: bug: the data uses "**5. Foldability:**"
                     _thinking_truncated = _thinking.split(leakage_marker)[0].strip()
                 
                 if _thinking_truncated:
@@ -208,7 +211,7 @@ def load_prompt_jsonl_extended_dual(
                     response_sft_map[_id] = combined_response
                     response_sft_map[_id.lower()] = combined_response
 
-    return prompt_map, response_qkv_map, response_sft_map
+    return prompt_map, response_qkv_map, response_sft_map, raw_text_map
 
 
 def encode_prompt_text(prompt: Optional[str]) -> torch.Tensor:

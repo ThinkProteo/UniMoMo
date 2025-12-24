@@ -19,7 +19,7 @@ from pathlib import Path
 UNIMOMO_ROOT = Path(__file__).parent
 sys.path.insert(0, str(UNIMOMO_ROOT))
 
-from models.modules.EPT.ept import EPTAttentionMoT
+from models.modules.EPT.ept_mot import EPTAttentionMoT
 
 
 def create_test_inputs(

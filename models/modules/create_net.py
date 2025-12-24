@@ -2,7 +2,7 @@
 # -*- coding:utf-8 -*-
 
 from .EPT.ept import XTransEncoderAct as EPT
-from .EPT.ept import XTransEncoderActMoT as EPTMoT
+from .EPT.ept_mot import XTransEncoderActMoT as EPTMoT
 
 def create_net(
     name,
