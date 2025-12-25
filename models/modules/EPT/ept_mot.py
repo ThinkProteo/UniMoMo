@@ -36,6 +36,116 @@ except:
     xformers_enable = False
 
 
+# ==============================================================================
+# Rotary Position Embedding (RoPE) for EPT-MoT
+# ==============================================================================
+
+class RotaryEmbedding(nn.Module):
+    """
+    Rotary Position Embedding for EPT-MoT attention.
+    
+    This enables position-aware attention in the structure-to-text cross-attention,
+    where:
+    - Text tokens have sequential positions (0, 1, 2, ...)
+    - VAE (structure) tokens all share position = text_length + 1
+    
+    This design allows structure tokens to "see" the full text context
+    while being positioned after the text sequence.
+    """
+    
+    def __init__(self, dim: int, base: float = 1000000.0, max_position_embeddings: int = 4096):
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        self.max_position_embeddings = max_position_embeddings
+        
+        # Compute inverse frequencies for rotation
+        # RoPE operates on pairs of elements, so we need dim/2 frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        
+        # Cache for cos/sin (lazily computed)
+        self._cos_cached = None
+        self._sin_cached = None
+        self._cached_max_pos = 0
+    
+    def _update_cache(self, max_position: int, device: torch.device, dtype: torch.dtype):
+        """Update the cos/sin cache if needed."""
+        if max_position <= self._cached_max_pos and self._cos_cached is not None:
+            return
+        
+        # Compute for all positions up to max_position
+        self._cached_max_pos = max(max_position, self.max_position_embeddings)
+        seq = torch.arange(self._cached_max_pos, device=device, dtype=torch.float32)
+        
+        # freqs: [max_pos, dim/2]
+        freqs = torch.outer(seq, self.inv_freq.to(device))
+        
+        # Duplicate for full dimension: [max_pos, dim]
+        emb = torch.cat([freqs, freqs], dim=-1)
+        
+        self._cos_cached = emb.cos().to(dtype)
+        self._sin_cached = emb.sin().to(dtype)
+    
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor):
+        """
+        Get cos/sin embeddings for given position IDs.
+        
+        Args:
+            x: Input tensor to determine device and dtype [B, n_heads, seq_len, dim]
+            position_ids: Position indices [B, seq_len]
+            
+        Returns:
+            cos, sin tensors both of shape [B, seq_len, dim]
+        """
+        max_pos = int(position_ids.max().item()) + 1
+        self._update_cache(max_pos, x.device, x.dtype)
+        
+        # Gather cos/sin for each position: [B, seq_len, dim]
+        cos = self._cos_cached[position_ids]
+        sin = self._sin_cached[position_ids]
+        
+        return cos, sin
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """
+    Rotate half of the features by 90 degrees.
+    Splits the last dimension in half and swaps with negation.
+    """
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def apply_rotary_embedding(
+    x: torch.Tensor, 
+    cos: torch.Tensor, 
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1
+) -> torch.Tensor:
+    """
+    Apply Rotary Position Embedding to input tensor.
+    
+    Args:
+        x: Input tensor [B, n_heads, seq_len, dim]
+        cos: Cosine embeddings [B, seq_len, dim]
+        sin: Sine embeddings [B, seq_len, dim]
+        unsqueeze_dim: Dimension to unsqueeze cos/sin for broadcasting to heads
+        
+    Returns:
+        Tensor with RoPE applied, same shape as input
+    """
+    # Unsqueeze to broadcast over heads: [B, 1, seq_len, dim]
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    
+    return x * cos + rotate_half(x) * sin
+
+
+# ==============================================================================
+
+
 class EPTLayerMoT(nn.Module):
     """
     MoT-enhanced EPT layer with optional text cross-attention.
@@ -92,6 +202,7 @@ class EPTLayerMoT(nn.Module):
         text_k: Optional[torch.Tensor] = None,  # [B, L_text_max, n_kv_heads, d_attn]
         text_v: Optional[torch.Tensor] = None,  # [B, L_text_max, n_kv_heads, d_head]
         mask_text: Optional[torch.Tensor] = None,  # [B, L_text_max]
+        text_lengths: Optional[torch.Tensor] = None,  # [B], actual text lengths for RoPE
     ):
         """
         Forward pass with optional text cross-attention.
@@ -103,6 +214,7 @@ class EPTLayerMoT(nn.Module):
             text_k: Text key embeddings from LLM [B, L, n_kv_heads, d_head]
             text_v: Text value embeddings from LLM [B, L, n_kv_heads, d_head]
             mask_text: Boolean mask for valid text positions [B, L]
+            text_lengths: Actual text lengths per sample for RoPE positions [B]
             
         Returns:
             H: Updated scalar features
@@ -115,6 +227,7 @@ class EPTLayerMoT(nn.Module):
             text_k=text_k,
             text_v=text_v,
             mask_text=mask_text,
+            text_lengths=text_lengths,
         )
         H, V = self.ffn_layer(H, V)
         return H, V
@@ -148,6 +261,8 @@ class EPTAttentionMoT(nn.Module):
         attn_bias: bool = True,
         qk_norm: bool = True,
         num_kv_groups: int = 4,
+        rope_theta: float = 1000000.0, #use qwen3 
+        max_position_embeddings: int = 4096,
     ):
         super().__init__()
 
@@ -200,6 +315,14 @@ class EPTAttentionMoT(nn.Module):
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
             self.text_k_norm = nn.Identity()
+        
+        # Rotary Position Embedding for position-aware attention
+        # Applied on expanded Q/K dimension (d_qk_head = 4 * d_head)
+        self.rotary_emb = RotaryEmbedding(
+            dim=self.d_qk_head,
+            base=rope_theta,
+            max_position_embeddings=max_position_embeddings,
+        )
 
     def forward(
         self,
@@ -209,6 +332,7 @@ class EPTAttentionMoT(nn.Module):
         text_k: Optional[torch.Tensor] = None,  # [B, L_text_max, n_kv_heads, d_head]
         text_v: Optional[torch.Tensor] = None,  # [B, L_text_max, n_kv_heads, d_head]
         mask_text: Optional[torch.Tensor] = None,  # [B, L_text_max], 1=valid
+        text_lengths: Optional[torch.Tensor] = None,  # [B], actual text lengths per sample
     ):
         B, N_vae_max, _ = H.shape
         device = H.device
@@ -218,15 +342,19 @@ class EPTAttentionMoT(nn.Module):
         # Handle text inputs
         if text_k is None or text_v is None:
             L_text_max = 0
-            text_k_proj = H.new_zeros(B, 0, self.n_kv_heads, self.d_qk_head)
             text_v = H.new_zeros(B, 0, self.n_kv_heads, self.d_head)
             mask_text = H.new_ones(B, 0, dtype=torch.bool)
+            text_lengths = torch.zeros(B, dtype=torch.long, device=device)
         else:
             assert text_k.shape[0] == B, "Batch size mismatch"
             L_text_max = text_k.shape[1]
             
             if mask_text is None:
                 mask_text = torch.ones(B, L_text_max, dtype=torch.bool, device=device)
+            
+            # Derive text_lengths from mask_text if not provided
+            if text_lengths is None:
+                text_lengths = mask_text.sum(dim=1).long()  # [B]
 
         # Compute VAE Q/K/V projections
         H_q_vae = self.scaler_q(H).view(B, N_vae_max, self.n_q_heads, self.d_qk_head)
@@ -258,6 +386,36 @@ class EPTAttentionMoT(nn.Module):
         q = H_q_vae.transpose(1, 2)  # [B, n_q, N_vae, d_qk_head]
         k = K_full.transpose(1, 2)   # [B, n_kv, L_total, d_qk_head]
         v = V_full.transpose(1, 2)   # [B, n_kv, L_total, 4*d_head]
+
+        # ========== ROTARY POSITION EMBEDDING ==========
+        # Position scheme:
+        # - Text tokens (keys): sequential positions 0, 1, 2, ..., text_len-1
+        # - VAE tokens (queries and keys): all share position = text_length
+        # 
+        # This allows VAE tokens to "see" the full text context while being
+        # positioned at the end of the sequence. All VAE tokens share the same
+        # relative position to all text tokens.
+        
+        # Position IDs for queries (VAE tokens only)
+        # All VAE tokens have position = text_length for their sample
+        # tok_pos_q: [B, N_vae_max]
+        tok_pos_q = text_lengths.unsqueeze(1).expand(B, N_vae_max)  # [B, N_vae]
+        
+        # Position IDs for keys (text + VAE tokens)
+        # Text: 0, 1, 2, ..., L_text_max-1 (padding positions will be masked)
+        # VAE: all at text_length for each sample
+        # tok_pos_k: [B, L_total]
+        text_positions = torch.arange(L_text_max, device=device).unsqueeze(0).expand(B, -1)  # [B, L_text]
+        vae_positions = text_lengths.unsqueeze(1).expand(B, N_vae_max)  # [B, N_vae]
+        tok_pos_k = torch.cat([text_positions, vae_positions], dim=1)  # [B, L_total]
+        
+        # Get cos/sin embeddings and apply RoPE
+        cos_q, sin_q = self.rotary_emb(q, tok_pos_q)
+        cos_k, sin_k = self.rotary_emb(k, tok_pos_k)
+        
+        q = apply_rotary_embedding(q, cos_q, sin_q)
+        k = apply_rotary_embedding(k, cos_k, sin_k)
+
 
         # Expand K/V for grouped query attention
         k = k.repeat_interleave(self.num_kv_groups, dim=1)  # [B, n_q, L_total, d_qk_head]
@@ -406,6 +564,7 @@ class TransformerMoT(nn.Module):
         text_k: Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]] = None,
         text_v: Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]] = None,
         mask_text: Optional[torch.Tensor] = None,  # [B, L_text_max]
+        text_lengths: Optional[torch.Tensor] = None,  # [B], actual text lengths for RoPE
     ):
         """
         Forward pass with optional text cross-attention.
@@ -423,6 +582,7 @@ class TransformerMoT(nn.Module):
             text_k: Text keys - single tensor or dict mapping layer_idx to tensor
             text_v: Text values - single tensor or dict mapping layer_idx to tensor
             mask_text: Text mask [B, L_text_max]
+            text_lengths: Actual text lengths per sample for RoPE positions [B]
             
         Returns:
             H_graph: Updated node features [N, d_hidden]
@@ -521,6 +681,7 @@ class TransformerMoT(nn.Module):
                 text_k=layer_text_k,
                 text_v=layer_text_v,
                 mask_text=mask_text,
+                text_lengths=text_lengths,
             )
 
         if self.layer_norm == "pre":
@@ -598,6 +759,7 @@ class XTransEncoderActMoT(nn.Module):
         text_k: Optional[torch.Tensor] = None,
         text_v: Optional[torch.Tensor] = None,
         mask_text: Optional[torch.Tensor] = None,
+        text_lengths: Optional[torch.Tensor] = None,
     ):
         """
         Forward pass with optional text cross-attention.
@@ -615,6 +777,7 @@ class XTransEncoderActMoT(nn.Module):
             text_k: Text keys [B, L_text, n_heads, d_head] (optional)
             text_v: Text values [B, L_text, n_heads, d_head] (optional)
             mask_text: Text mask [B, L_text] (optional)
+            text_lengths: Actual text lengths per sample for RoPE [B] (optional)
 
         Returns:
             H: Updated node features [N, hidden_size]
@@ -633,6 +796,7 @@ class XTransEncoderActMoT(nn.Module):
             text_k=text_k,
             text_v=text_v,
             mask_text=mask_text,
+            text_lengths=text_lengths,
         )
         block_repr = std_conserve_scatter_sum(H, block_id, dim=0)
         graph_repr = std_conserve_scatter_sum(block_repr, batch_id, dim=0)

@@ -55,6 +55,7 @@ class EpsilonNet(nn.Module):
             text_k=None,    # Optional: text key features for conditioning
             text_v=None,    # Optional: text value features for conditioning
             mask_text=None, # Optional: text attention mask
+            text_lengths=None,  # Optional: [B] actual text lengths for RoPE
         ):
         """
         Args:
@@ -63,7 +64,7 @@ class EpsilonNet(nn.Module):
             generate_mask: (N)
             batch_ids: (N)
             beta: (N)
-            text_k, text_v, mask_text: Optional text conditioning inputs
+            text_k, text_v, mask_text, text_lengths: Optional text conditioning inputs
         Returns:
             eps_H: (N, hidden_size)
             eps_X: (N, 3)
@@ -75,7 +76,8 @@ class EpsilonNet(nn.Module):
         block_ids = torch.arange(in_feat.shape[0], device=in_feat.device)
         
         next_H, next_X = self.encoder(in_feat, X_noisy, block_ids, batch_ids, edges, edge_embed,
-                                      text_k=text_k, text_v=text_v, mask_text=mask_text)
+                                      text_k=text_k, text_v=text_v, mask_text=mask_text, 
+                                      text_lengths=text_lengths)
 
         # equivariant vector features changes
         eps_X = next_X - X_noisy
@@ -154,6 +156,7 @@ class FullDPM(nn.Module):
             text_k=None,    # Optional: text key features for conditioning
             text_v=None,    # Optional: text value features for conditioning
             mask_text=None, # Optional: text attention mask
+            text_lengths=None,  # Optional: [B] actual text lengths for RoPE
         ):
 
         # Use instance configuration if not overridden
@@ -178,7 +181,7 @@ class FullDPM(nn.Module):
             # EpsilonNet outputs: model_out = x_pred - noisy
             model_out_H, model_out_X = self.eps_net(
                 H_noisy, X_noisy, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta, 
-                text_k=text_k, text_v=text_v, mask_text=mask_text
+                text_k=text_k, text_v=text_v, mask_text=mask_text, text_lengths=text_lengths
             )
             
             # 3. Reconstruct x_0 (prediction)
@@ -216,7 +219,7 @@ class FullDPM(nn.Module):
             beta = self.trans_x.get_timestamp(t)[batch_ids]  # [N]
             eps_H_pred, eps_X_pred = self.eps_net(
                 H_noisy, X_noisy, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta,
-                text_k=text_k, text_v=text_v, mask_text=mask_text
+                text_k=text_k, text_v=text_v, mask_text=mask_text, text_lengths=text_lengths
             )
 
             loss_dict = {}
@@ -247,6 +250,7 @@ class FullDPM(nn.Module):
             text_k=None,    # Optional: text key features for conditioning
             text_v=None,    # Optional: text value features for conditioning
             mask_text=None, # Optional: text attention mask
+            text_lengths=None,  # Optional: [B] actual text lengths for RoPE
         ):
         
         # Use instance configuration if not overridden
@@ -278,7 +282,7 @@ class FullDPM(nn.Module):
             # Network prediction
             model_out_H, model_out_X = self.eps_net(
                 H_t, X_t, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta,
-                text_k=text_k, text_v=text_v, mask_text=mask_text
+                text_k=text_k, text_v=text_v, mask_text=mask_text, text_lengths=text_lengths
             )
 
             if ispred_x:

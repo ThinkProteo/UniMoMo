@@ -93,10 +93,11 @@ class LDMMolDesign(nn.Module):
             text_k=None,    # Optional: [B, L_text, n_kv_heads, d_head] text key features
             text_v=None,    # Optional: [B, L_text, n_kv_heads, d_head] text value features
             mask_text=None, # Optional: [B, L_text] text attention mask
+            text_lengths=None,  # Optional: [B] actual text lengths for RoPE
             t=None,         # Optional: fixed timestep for debugging/overfitting
         ):
         '''
-            Optional text conditioning via text_k, text_v, mask_text.
+            Optional text conditioning via text_k, text_v, mask_text, text_lengths.
             When None, model behaves exactly as original UniMoMo.
         '''
 
@@ -135,6 +136,7 @@ class LDMMolDesign(nn.Module):
             text_k=text_k,
             text_v=text_v,
             mask_text=mask_text,
+            text_lengths=text_lengths,
             t=t,
         )
 
@@ -208,6 +210,7 @@ class LDMMolDesign(nn.Module):
             text_k=None,    # Optional: [B, L_text, n_kv_heads, d_head] text key features
             text_v=None,    # Optional: [B, L_text, n_kv_heads, d_head] text value features
             mask_text=None, # Optional: [B, L_text] text attention mask
+            text_lengths=None,  # Optional: [B] actual text lengths for RoPE
             sample_opt={
                 'pbar': False,
                 # 'energy_func': None,
@@ -217,7 +220,7 @@ class LDMMolDesign(nn.Module):
         ):
         '''
             Sample from the diffusion model with optional text conditioning.
-            When text_k, text_v, mask_text are provided, the generation is conditioned on text embeddings.
+            When text_k, text_v, mask_text, text_lengths are provided, the generation is conditioned on text embeddings.
         '''
 
         vae_decode_n_iter = sample_opt.pop('vae_decode_n_iter', 10)
@@ -271,6 +274,7 @@ class LDMMolDesign(nn.Module):
             text_k=text_k,
             text_v=text_v,
             mask_text=mask_text,
+            text_lengths=text_lengths,
             **sample_opt
         )
         X_0, H_0 = traj[0]
