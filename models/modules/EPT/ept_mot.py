@@ -146,7 +146,7 @@ class EPTAttentionMoT(nn.Module):
         residual: bool = True,
         vector_act: str = "none",
         attn_bias: bool = True,
-        qk_norm: bool = False,
+        qk_norm: bool = True,
         num_kv_groups: int = 4,
     ):
         super().__init__()
@@ -199,7 +199,7 @@ class EPTAttentionMoT(nn.Module):
         else:
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
-            self.text_k_norm = nn.Indentity()
+            self.text_k_norm = nn.Identity()
 
     def forward(
         self,
