@@ -275,6 +275,8 @@ class FullDPM(nn.Module):
 
         for t in pbar(range(self.num_steps, 0, -1)):
             X_t, H_t = traj[t]
+            # why?
+            X_t, H_t = torch.round(X_t, decimals=4), torch.round(H_t, decimals=4) # reduce numerical error
             
             beta = self.trans_x.get_timestamp(t).view(1).repeat(X_t.shape[0])
             t_tensor = torch.full([X_t.shape[0], ], fill_value=t, dtype=torch.long, device=X_t.device)
