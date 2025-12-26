@@ -53,7 +53,7 @@ class RotaryEmbedding(nn.Module):
     while being positioned after the text sequence.
     """
     
-    def __init__(self, dim: int, base: float = 1000000.0, max_position_embeddings: int = 4096):
+    def __init__(self, dim: int, base: float = 100000.0, max_position_embeddings: int = 4096):
         super().__init__()
         self.dim = dim
         self.base = base
@@ -261,7 +261,7 @@ class EPTAttentionMoT(nn.Module):
         attn_bias: bool = True,
         qk_norm: bool = True,
         num_kv_groups: int = 4,
-        rope_theta: float = 1000000.0, #use qwen3 
+        rope_theta: float = 100000.0, #use qwen3 
         max_position_embeddings: int = 4096,
     ):
         super().__init__()
