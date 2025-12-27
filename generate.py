@@ -69,7 +69,9 @@ def generate_wrapper(model, sample_opt={}):
     elif isinstance(model, models.LDMMolDesign):# or isinstance(model, models.LFMMolDesign):
         def wrapper(batch):
             # Pass sample_opt (which now contains ispred_x) to the model
-            res_tuple = model.sample(sample_opt=sample_opt, **batch)
+            # Filter out keys not accepted by model.sample()
+            batch_filtered = {k: v for k, v in batch.items() if k != 'sample_id'}
+            res_tuple = model.sample(sample_opt=sample_opt, **batch_filtered)
             if len(res_tuple) == 6:
                 batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = res_tuple
             else:

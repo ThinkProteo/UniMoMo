@@ -32,6 +32,7 @@ class EpsilonNet(nn.Module):
         ):
         super().__init__()
 
+        self.encoder_type = encoder_type  # Store for checking text conditioning support
         edge_embed_size = hidden_size // 4
         self.input_mlp = MLP(
             input_size + hidden_size * 2, # latent variable, cond embedding, time embedding
@@ -75,9 +76,13 @@ class EpsilonNet(nn.Module):
         edge_embed = self.edge_embedding(edge_types)
         block_ids = torch.arange(in_feat.shape[0], device=in_feat.device)
         
-        next_H, next_X = self.encoder(in_feat, X_noisy, block_ids, batch_ids, edges, edge_embed,
-                                      text_k=text_k, text_v=text_v, mask_text=mask_text, 
-                                      text_lengths=text_lengths)
+        # Only pass text conditioning to encoders that support it (e.g., EPTMoT)
+        if self.encoder_type in ('EPTMoT',):
+            next_H, next_X = self.encoder(in_feat, X_noisy, block_ids, batch_ids, edges, edge_embed,
+                                          text_k=text_k, text_v=text_v, mask_text=mask_text, 
+                                          text_lengths=text_lengths)
+        else:
+            next_H, next_X = self.encoder(in_feat, X_noisy, block_ids, batch_ids, edges, edge_embed)
 
         # equivariant vector features changes
         eps_X = next_X - X_noisy
