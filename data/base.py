@@ -41,6 +41,7 @@ class BaseDataset(MMAPDataset):
             prevent_leakage_qkv_only: Optional[bool] = False,
             leakage_marker: Optional[str] = '**Foldability:**',
             use_answer_only_qkv: Optional[bool] = False,
+            use_gt_seq_for_qkv: Optional[bool] = False,
         ) -> None:
         super().__init__(mmap_dir, specify_data, specify_index)
         self.mmap_dir = mmap_dir
@@ -49,6 +50,7 @@ class BaseDataset(MMAPDataset):
         self.prevent_leakage_qkv_only = prevent_leakage_qkv_only
         self.leakage_marker = leakage_marker
         self.use_answer_only_qkv = use_answer_only_qkv
+        self.use_gt_seq_for_qkv = use_gt_seq_for_qkv
 
         # Load prompt data based on format
         if prompt_jsonl:
@@ -296,9 +298,18 @@ class BaseDataset(MMAPDataset):
         if self.use_extended_format:
             # Extended format: separate prompt and response
             data['prompt_text'] = self._find_prompt(summary.id)
-            data['response_qkv_text'] = self._find_response_qkv(summary.id)
             data['response_sft_text'] = self._find_response_sft(summary.id)
             data['raw_text'] = self._find_raw_text(summary.id)
+            
+            # QKV conditioning: use ground truth sequence or response text
+            if self.use_gt_seq_for_qkv:
+                # Use ground truth CDR sequence for QKV conditioning (debug mode)
+                data['response_qkv_text'] = summary.ref_seq
+            else:
+                data['response_qkv_text'] = self._find_response_qkv(summary.id)
+
+        # Always include ref_seq for potential use in inference/debugging
+        data['ref_seq'] = summary.ref_seq
 
         return data
 
