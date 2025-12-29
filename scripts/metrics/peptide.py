@@ -39,7 +39,7 @@ def pdb_to_complex(pdb_path, selected_chains):
     # Create a temporary file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb") as tmp_file:
         temp_pdb_path = tmp_file.name
-        
+
         # Open the input PDB and write lines excluding CONECT records
         with open(pdb_path, 'r') as infile, open(temp_pdb_path, 'w') as outfile:
             for line in infile:
@@ -101,7 +101,7 @@ def robust_dG(pdb, rec_chains, lig_chains, gen_block_idx=None, n=3, relax=True, 
         res_id = [idx[0], idx[1][0]]
         if idx[1][1] != '': res_id.append(idx[1][1])
         return res_id
-    
+
     if gen_block_idx is not None:
         res_first = _to_rosetta_res_id(gen_block_idx[0])
         res_last = _to_rosetta_res_id(gen_block_idx[-1])
@@ -132,7 +132,7 @@ def extract_paired_coords(gen_blocks: List[Block], ref_blocks: List[Block], ca_o
         if ca_only: allow_atoms = { 'CA': 1 } if 'CA' in allow_atoms else {}
         elif gen_block.name != ref_block.name: # only backbone atoms
             allow_atoms = { atom: 1 for atom in const.backbone_atoms if atom in allow_atoms }
-    
+
         gen_atoms, ref_atoms = {}, {}
         for atom in gen_block: gen_atoms[atom.name] = atom.get_coord()
         for atom in ref_block: ref_atoms[atom.name] = atom.get_coord()
@@ -166,7 +166,7 @@ def run_ref_metrics(task: Task, compute_dg: bool = True):
         ref_pdb = _get_ref_pdb(os.path.dirname(task.id), task.root_dir)
     else:
         ref_pdb = _get_ref_pdb(task.id, task.root_dir)
-    
+
     task.ref_metrics = {}
     # set reference dG
     if compute_dg:
@@ -211,7 +211,7 @@ def run_basic_metrics(task: Task):
     except Exception:
         print_log(f'{gen_pdb} generation part missing', level='ERROR')
     ref_blocks = [recur_index(ref_cplx, block_id) for block_id in gen_block_idx]
-    
+
     # get sequence
     gen_seq = ''.join([VOCAB.abrv_to_symbol(block.name) for block in gen_blocks])
     ref_seq = ''.join([VOCAB.abrv_to_symbol(block.name) for block in ref_blocks]) 
@@ -235,7 +235,7 @@ def run_basic_metrics(task: Task):
     task.metrics['C_RMSD(CA)'] = round(c_rmsd, 2)
     l_rmsd = compute_rmsd(gen_ca_x, ref_ca_x, need_align=True)
     task.metrics['L_RMSD(CA)'] = round(l_rmsd, 2)
-    
+
     # DockQ
     try:
         dockq_score = round(dockq(gen_pdb, ref_pdb, task.target_chains_ids, task.ligand_chains_ids), 3)
@@ -314,7 +314,7 @@ def aggregate_metrics(tasks: List[Task]):
         aggr_results['Sequence Diversity'] = round(seq_div, 3)
         aggr_results['Struct Diversity'] = round(struct_div, 3)
         aggr_results['Codesign Diversity'] = round(co_div, 3)
-    
+
     return aggr_results
 
 
@@ -383,7 +383,7 @@ def main(args):
         if _id not in id2items: id2items[_id] = []
         id2items[_id].append(item)
     ids = list(id2items.keys())
-    
+
     eval_results_path = os.path.join(os.path.dirname(args.results), f'eval_report_{args.log_suffix}.jsonl')
 
     fout = open(eval_results_path, 'w')
@@ -398,7 +398,7 @@ def main(args):
             _id, ref, gen = ray.get(done_id)
             ref_metrics.append(ref)
             metrics.append(gen)
-            
+
             record = { 'id': _id }
             record.update(ref)
             record.update(gen)
@@ -410,7 +410,7 @@ def main(args):
 
     fout.close()
     ray.shutdown()
-    
+
     log_file = open(os.path.join(os.path.dirname(args.results), f'eval_final_{args.log_suffix}.log'), 'w')
     def print_and_log(s, **kwargs):
         print(s, **kwargs)
@@ -454,14 +454,14 @@ def main(args):
                 corrs = [val['pmet_corr'] for val in vals if val['pmet_corr'] != 0]
                 if len(corrs) == 0: corrs = [0]
                 print_and_log(f'\tcorrelation with flow matching likelihood: {sum(corrs) / len(corrs)}')
-            
+
         else:
             print_and_log(f'{name} (mean): {sum(vals) / len(vals)}')
             lowest_i = min([i for i in range(len(vals))], key=lambda i: vals[i])
             highest_i = max([i for i in range(len(vals))], key=lambda i: vals[i])
             print_and_log(f'\tlowest: {vals[lowest_i]}, id: {ids[lowest_i]}')
             print_and_log(f'\thighest: {vals[highest_i]}, id: {ids[highest_i]}')
-    
+
     # get distribution of dihedral angles
     print_and_log('\n')
     pdbs, selected_residues = [], []
