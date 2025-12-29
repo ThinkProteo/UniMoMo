@@ -40,6 +40,7 @@ class BaseDataset(MMAPDataset):
             prevent_leakage: Optional[bool] = True,
             prevent_leakage_qkv_only: Optional[bool] = False,
             leakage_marker: Optional[str] = '**Foldability:**',
+            use_answer_only_qkv: Optional[bool] = False,
         ) -> None:
         super().__init__(mmap_dir, specify_data, specify_index)
         self.mmap_dir = mmap_dir
@@ -47,6 +48,7 @@ class BaseDataset(MMAPDataset):
         self.prevent_leakage = prevent_leakage
         self.prevent_leakage_qkv_only = prevent_leakage_qkv_only
         self.leakage_marker = leakage_marker
+        self.use_answer_only_qkv = use_answer_only_qkv
 
         # Load prompt data based on format
         if prompt_jsonl:
@@ -56,7 +58,8 @@ class BaseDataset(MMAPDataset):
                     self._prompt_map, self._response_qkv_map, self._response_sft_map, self._raw_text_map = load_prompt_jsonl_extended_dual(
                         prompt_jsonl,
                         prevent_leakage_qkv_only=True,
-                        leakage_marker=leakage_marker
+                        leakage_marker=leakage_marker,
+                        use_answer_only_qkv=use_answer_only_qkv
                     )
                     # For backward compatibility, set _response_map to SFT version (used in legacy paths)
                     self._response_map = self._response_sft_map

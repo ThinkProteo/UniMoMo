@@ -114,7 +114,8 @@ def load_prompt_jsonl_extended_dual(
     thinking_key: str = 'thinking',
     response_key: str = 'answer',
     prevent_leakage_qkv_only: bool = False,
-    leakage_marker: str = '**Foldability:**'
+    leakage_marker: str = '**Foldability:**',
+    use_answer_only_qkv: bool = False
 ) -> tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
     """
     Load extended JSONL with TWO response versions for separate QKV and SFT processing.
@@ -131,11 +132,13 @@ def load_prompt_jsonl_extended_dual(
         response_key: Key for response text (default: 'answer')
         prevent_leakage_qkv_only: If True, return dual responses (truncated for QKV, full for SFT)
         leakage_marker: Marker indicating start of answer content in thinking (default: '**Foldability:**')
+        use_answer_only_qkv: If True, QKV only uses answer text (no thinking/foldability).
+                            This is a DEBUG mode to test if diffusion can learn from ground truth answer only.
 
     Returns:
         (prompt_map, response_qkv_map, response_sft_map): Three dicts mapping sample_id -> text
             - prompt_map: Question text
-            - response_qkv_map: Thinking truncated at marker (for QKV extraction)
+            - response_qkv_map: Thinking truncated at marker (for QKV extraction), or answer-only if use_answer_only_qkv
             - response_sft_map: Full thinking + answer (for SFT loss)
             
         If prevent_leakage_qkv_only=False, response_qkv_map == response_sft_map (backward compatible)
@@ -175,14 +178,21 @@ def load_prompt_jsonl_extended_dual(
                 raw_text_map[_id] = record
                 raw_text_map[_id.lower()] = record
                 
-                # 1. QKV version: Truncated thinking (no answer leakage)
-                _thinking_truncated = _thinking
-                if _thinking and leakage_marker in _thinking: #Erran: bug: the data uses "**5. Foldability:**"
-                    _thinking_truncated = _thinking.split(leakage_marker)[0].strip()
-                
-                if _thinking_truncated:
-                    response_qkv_map[_id] = _thinking_truncated
-                    response_qkv_map[_id.lower()] = _thinking_truncated
+                if use_answer_only_qkv:
+                    # DEBUG MODE: QKV uses only the answer text (no thinking, no foldability)
+                    # Purpose: Test if diffusion can learn using ground truth answer representation
+                    if _answer:
+                        response_qkv_map[_id] = _answer
+                        response_qkv_map[_id.lower()] = _answer
+                else:
+                    # 1. QKV version: Truncated thinking (no answer leakage)
+                    _thinking_truncated = _thinking
+                    if _thinking and leakage_marker in _thinking: #Erran: bug: the data uses "**5. Foldability:**"
+                        _thinking_truncated = _thinking.split(leakage_marker)[0].strip()
+                    
+                    if _thinking_truncated:
+                        response_qkv_map[_id] = _thinking_truncated
+                        response_qkv_map[_id.lower()] = _thinking_truncated
                 
                 # 2. SFT version: Full thinking + answer
                 response_parts = []
