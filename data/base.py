@@ -300,6 +300,9 @@ class BaseDataset(MMAPDataset):
             data['response_sft_text'] = self._find_response_sft(summary.id)
             data['raw_text'] = self._find_raw_text(summary.id)
 
+        # Always include ref_seq (ground truth sequence) for debug conditioning
+        data['ref_seq'] = summary.ref_seq
+
         return data
 
     def collate_fn(self, batch):
