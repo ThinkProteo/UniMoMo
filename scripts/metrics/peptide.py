@@ -160,7 +160,7 @@ class Task:
 
 
 @ray.remote(num_cpus=1) # dG requires larger RAM
-def run_ref_metrics(task: Task):
+def run_ref_metrics(task: Task, compute_dg: bool = True):
 
     if task.is_antibody:
         ref_pdb = _get_ref_pdb(os.path.dirname(task.id), task.root_dir)
@@ -169,12 +169,13 @@ def run_ref_metrics(task: Task):
     
     task.ref_metrics = {}
     # set reference dG
-    ref_dG_relax = robust_dG(
-        ref_pdb, task.target_chains_ids,
-        task.ligand_chains_ids,
-        task.gen_block_idx if task.is_antibody else None,
-        relax_save_pdb=ref_pdb.rstrip('.pdb') + '_rosetta.pdb')
-    task.ref_metrics['ref_dG'] = round(ref_dG_relax, 2)
+    if compute_dg:
+        ref_dG_relax = robust_dG(
+            ref_pdb, task.target_chains_ids,
+            task.ligand_chains_ids,
+            task.gen_block_idx if task.is_antibody else None,
+            relax_save_pdb=ref_pdb.rstrip('.pdb') + '_rosetta.pdb')
+        task.ref_metrics['ref_dG'] = round(ref_dG_relax, 2)
 
     # ref clash
     clash_inner, clash_outer = eval_pdb_clash(ref_pdb, task.target_chains_ids, task.ligand_chains_ids)
@@ -318,8 +319,8 @@ def aggregate_metrics(tasks: List[Task]):
 
 
 @ray.remote
-def pipeline_eval(input: Tuple[List[dict], bool]):
-    items, is_antibody = input
+def pipeline_eval(input: Tuple[List[dict], bool, bool]):
+    items, is_antibody, compute_dg = input
     item = items[0]
     ref_task = Task(
         root_dir = item['root_dir'],
@@ -336,14 +337,15 @@ def pipeline_eval(input: Tuple[List[dict], bool]):
         run_ref_metrics,
     ]
     for fn in ref_funcs:
-        ref_task = fn.remote(ref_task)
+        ref_task = fn.remote(ref_task, compute_dg)
     ref_task = ray.get(ref_task)
 
     # pipeline tasks
     funcs = [
         run_basic_metrics,
-        run_dG,
     ]
+    if compute_dg:
+        funcs.append(run_dG)
 
     # get all tasks to run
     finished_tasks = []
@@ -387,7 +389,8 @@ def main(args):
     fout = open(eval_results_path, 'w')
 
     ray.init(num_cpus=args.num_workers)
-    futures = [pipeline_eval.remote((item, args.antibody)) for item in id2items.values()]
+    compute_dg = not args.basic_only
+    futures = [pipeline_eval.remote((item, args.antibody, compute_dg)) for item in id2items.values()]
     ref_metrics, metrics = [], []
     while len(futures) > 0:
         done_ids, futures = ray.wait(futures, num_returns=1)
@@ -414,9 +417,10 @@ def main(args):
         log_file.write(s + '\n')
 
     # calculate reference
-    for name in ref_metrics[0]:
-        vals = [m[name] for m in ref_metrics]
-        print_and_log(f'reference {name}: mean {sum(vals) / len(vals)}, median {statistics.median(vals)}')
+    if len(ref_metrics) > 0 and len(ref_metrics[0]) > 0:
+        for name in ref_metrics[0]:
+            vals = [m[name] for m in ref_metrics]
+            print_and_log(f'reference {name}: mean {sum(vals) / len(vals)}, median {statistics.median(vals)}')
 
     # individual level results
     print_and_log('Point-wise evaluation results:')
@@ -485,6 +489,8 @@ def parse():
     parser.add_argument('--num_workers', type=int, default=8, help='Number of workers to use')
     parser.add_argument('--antibody', action='store_true', help='Special reference id and only relax CDR regions')
     parser.add_argument('--log_suffix', type=str, default='', help='Suffix of the log file (eval_final.log)')
+    parser.add_argument('--key_residue', action='store_true', help="Only focus on the key residues mentioned in COTs for AAR.")
+    parser.add_argument('--basic_only', action='store_true', help="Only compute basic metrics (AAR, RMSD, DockQ, Clash) without dG and energy terms.")
 
     return parser.parse_args()
 
