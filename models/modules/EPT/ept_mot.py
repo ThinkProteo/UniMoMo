@@ -798,7 +798,5 @@ class XTransEncoderActMoT(nn.Module):
             mask_text=mask_text,
             text_lengths=text_lengths,
         )
-        block_repr = std_conserve_scatter_sum(H, block_id, dim=0)
-        graph_repr = std_conserve_scatter_sum(block_repr, batch_id, dim=0)
         return H, V.reshape(Z.shape) + Z
 
