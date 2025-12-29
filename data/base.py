@@ -73,7 +73,6 @@ class BaseDataset(MMAPDataset):
                     # In non-dual mode, both maps are the same
                     self._response_qkv_map = self._response_map
                     self._response_sft_map = self._response_map
-                    self._raw_text_map = self._response_map # just for backward compatibility
             else:
                 # Legacy format: single prompt field
                 self._prompt_map = load_prompt_jsonl(prompt_jsonl)

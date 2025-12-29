@@ -96,18 +96,8 @@ class MMAPDataset(torch.utils.data.Dataset):
         self._mmap = mmap.mmap(self._data_file.fileno(), 0, access=mmap.ACCESS_READ)
     
     def __del__(self):
-        """Cleanup resources. Defensive against partial initialization failures."""
-        if hasattr(self, '_mmap') and self._mmap is not None:
-            try:
-                self._mmap.close()
-            except Exception:
-                pass  # Ignore errors during cleanup
-        
-        if hasattr(self, '_data_file') and self._data_file is not None:
-            try:
-                self._data_file.close()
-            except Exception:
-                pass  # Ignore errors during cleanup
+        self._mmap.close()
+        self._data_file.close()
 
     def __len__(self):
         return len(self._indexes)

@@ -223,20 +223,3 @@ def load_prompt_jsonl_extended_dual(
 
     return prompt_map, response_qkv_map, response_sft_map, raw_text_map
 
-
-def default_prompt_path(dataset_type: str) -> Optional[str]:
-    """
-    Return default prompt JSONL path for a given dataset type.
-    
-    This is a backward compatibility function for datasets that don't explicitly
-    provide a prompt_jsonl path. Returns None to indicate no default prompts.
-    
-    Args:
-        dataset_type: Type of dataset ('antibody', 'peptide', 'molecule', etc.)
-    
-    Returns:
-        Path to default prompt file, or None if no default exists
-    """
-    # For inference/generation, prompts should be explicitly provided via config
-    # Return None to avoid silent failures
-    return None
