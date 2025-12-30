@@ -216,6 +216,8 @@ def run_basic_metrics(task: Task):
     gen_seq = ''.join([VOCAB.abrv_to_symbol(block.name) for block in gen_blocks])
     ref_seq = ''.join([VOCAB.abrv_to_symbol(block.name) for block in ref_blocks]) 
 
+    #print('gen_seq, ref_seq:, is_match:', gen_seq, ref_seq, gen_seq == ref_seq)
+
     # set sequence
     task.seq = gen_seq
 
@@ -223,6 +225,7 @@ def run_basic_metrics(task: Task):
     assert len(gen_seq) == len(ref_seq)
     _, seq_id = align_sequences(gen_seq, ref_seq)
     task.metrics['AAR'] = round(seq_id, 4)
+    
 
     # CA coordinates
     gen_ca_x, ref_ca_x = extract_paired_coords(gen_blocks, ref_blocks, ca_only=True)

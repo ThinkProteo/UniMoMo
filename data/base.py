@@ -285,9 +285,24 @@ class BaseDataset(MMAPDataset):
             data['raw_text'] = self._find_raw_text(summary.id)
             
             # QKV conditioning: use ground truth sequence or response text
+            # NOTE: The collate_fn uses raw_text['thinking'] to build <think>...</think>
+            # QKV extraction happens on tokens within <think>...</think>
+            # So to override QKV content, we override raw_text['thinking']
             if self.use_gt_seq:
-                # Use ground truth CDR sequence for QKV conditioning (debug mode)
+                # DEBUG: Use ground truth CDR sequence for QKV conditioning
+                # Override 'thinking' so collate_fn uses GT seq for <think>...</think>
                 data['response_qkv_text'] = summary.ref_seq
+                if data.get('raw_text'):
+                    data['raw_text'] = dict(data['raw_text'])  # Make a copy to avoid mutating cache
+                    data['raw_text']['thinking'] = summary.ref_seq  # GT seq becomes thinking content
+            elif self.use_answer_only_qkv:
+                # DEBUG: Use answer text for QKV conditioning
+                # Override 'thinking' with answer so QKV extracts from answer tokens
+                answer_text = data.get('raw_text', {}).get('answer', '') if data.get('raw_text') else ''
+                data['response_qkv_text'] = answer_text
+                if data.get('raw_text'):
+                    data['raw_text'] = dict(data['raw_text'])  # Make a copy
+                    data['raw_text']['thinking'] = answer_text  # Answer becomes thinking content
             else:
                 data['response_qkv_text'] = self._find_response_qkv(summary.id)
 
