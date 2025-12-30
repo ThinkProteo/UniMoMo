@@ -29,9 +29,9 @@ class AntibodyDataset(BaseDataset):
             prevent_leakage_qkv_only: bool = False,
             leakage_marker: str = '**Foldability:**',
             use_answer_only_qkv: bool = False,
-            use_gt_seq_for_qkv: bool = False,
+            use_gt_seq: bool = False,
         ) -> None:
-        super().__init__(mmap_dir, specify_data, specify_index, prompt_jsonl, strict_prompt, use_extended_format, prevent_leakage, prevent_leakage_qkv_only, leakage_marker, use_answer_only_qkv, use_gt_seq_for_qkv)
+        super().__init__(mmap_dir, specify_data, specify_index, prompt_jsonl, strict_prompt, use_extended_format, prevent_leakage, prevent_leakage_qkv_only, leakage_marker, use_answer_only_qkv, use_gt_seq)
         self.mmap_dir = mmap_dir
         # self.resampler = ClusterResampler(cluster) if cluster else None  # should only be used in training!
         self.length_type = length_type

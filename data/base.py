@@ -41,7 +41,7 @@ class BaseDataset(MMAPDataset):
             prevent_leakage_qkv_only: Optional[bool] = False,
             leakage_marker: Optional[str] = '**Foldability:**',
             use_answer_only_qkv: Optional[bool] = False,
-            use_gt_seq_for_qkv: Optional[bool] = False,
+            use_gt_seq: Optional[bool] = False,
         ) -> None:
         super().__init__(mmap_dir, specify_data, specify_index)
         self.mmap_dir = mmap_dir
@@ -50,37 +50,20 @@ class BaseDataset(MMAPDataset):
         self.prevent_leakage_qkv_only = prevent_leakage_qkv_only
         self.leakage_marker = leakage_marker
         self.use_answer_only_qkv = use_answer_only_qkv
-        self.use_gt_seq_for_qkv = use_gt_seq_for_qkv
+        self.use_gt_seq = use_gt_seq
 
         # Load prompt data based on format
         if prompt_jsonl:
-            if use_extended_format:
-                if prevent_leakage_qkv_only:
-                    # NEW: Dual response mode (different text for QKV vs SFT)
-                    self._prompt_map, self._response_qkv_map, self._response_sft_map, self._raw_text_map = load_prompt_jsonl_extended_dual(
-                        prompt_jsonl,
-                        prevent_leakage_qkv_only=True,
-                        leakage_marker=leakage_marker,
-                        use_answer_only_qkv=use_answer_only_qkv
-                    )
-                    # For backward compatibility, set _response_map to SFT version (used in legacy paths)
-                    self._response_map = self._response_sft_map
-                else:
-                    # Original: Single response (backward compatible)
-                    self._prompt_map, self._response_map = load_prompt_jsonl_extended(
-                        prompt_jsonl,
-                        prevent_leakage=prevent_leakage,
-                        leakage_marker=leakage_marker
-                    )
-                    # In non-dual mode, both maps are the same
-                    self._response_qkv_map = self._response_map
-                    self._response_sft_map = self._response_map
-            else:
-                # Legacy format: single prompt field
-                self._prompt_map = load_prompt_jsonl(prompt_jsonl)
-                self._response_map = None
-                self._response_qkv_map = None
-                self._response_sft_map = None
+            if prevent_leakage_qkv_only: # only support this for now!
+                # NEW: Dual response mode (different text for QKV vs SFT)
+                self._prompt_map, self._response_qkv_map, self._response_sft_map, self._raw_text_map = load_prompt_jsonl_extended_dual(
+                    prompt_jsonl,
+                    prevent_leakage_qkv_only=True,
+                    leakage_marker=leakage_marker,
+                    use_answer_only_qkv=use_answer_only_qkv
+                )
+                # For backward compatibility, set _response_map to SFT version (used in legacy paths)
+                self._response_map = self._response_sft_map
         else:
             self._prompt_map = None
             self._response_map = None
@@ -302,7 +285,7 @@ class BaseDataset(MMAPDataset):
             data['raw_text'] = self._find_raw_text(summary.id)
             
             # QKV conditioning: use ground truth sequence or response text
-            if self.use_gt_seq_for_qkv:
+            if self.use_gt_seq:
                 # Use ground truth CDR sequence for QKV conditioning (debug mode)
                 data['response_qkv_text'] = summary.ref_seq
             else:
