@@ -249,7 +249,7 @@ class EPTAttentionMoT(nn.Module):
     """
     
     # Class-level debug settings
-    _debug_text_attn = False  # Set to True to print text attention stats
+    _debug_text_attn = True  # Set to True to print text attention stats
     _debug_step_counter = 0
     _debug_print_interval = 50  # Print every N forward passes
 
@@ -384,12 +384,17 @@ class EPTAttentionMoT(nn.Module):
         # Apply Q/K normalization
         H_q_vae = self.q_norm(H_q_vae)
         H_k_vae = self.k_norm(H_k_vae)
-        text_k = self.text_k_norm(text_k)
+        if text_k is not None:
+            text_k = self.text_k_norm(text_k)
 
         # ========== BATCHED ATTENTION ==========
 
         # Concatenate text and VAE K/V along sequence dimension
-        K_full = torch.cat([text_k, H_k_vae], dim=1)  # [B, L_total, n_kv, d_qk_head]
+        # Handle None text_k (e.g., when using text injection mode)
+        if text_k is not None:
+            K_full = torch.cat([text_k, H_k_vae], dim=1)  # [B, L_total, n_kv, d_qk_head]
+        else:
+            K_full = H_k_vae  # No text keys
         
         # CRITICAL FIX: Text values are pure scalar embeddings (Qwen head_dim), but EPT 
         # expects values with [scalar(d_head) + 3*vector(3*d_head)] = 4*d_head structure.
@@ -404,10 +409,10 @@ class EPTAttentionMoT(nn.Module):
                 device=device, dtype=text_v.dtype
             )  # Zero vector contribution
             text_v_structured = torch.cat([text_v_scalar, text_v_vector_pad], dim=-1)
+            V_full = torch.cat([text_v_structured, V_attn_vae], dim=1)  # [B, L_total, n_kv, 4*d_head]
         else:
-            text_v_structured = text_v
+            V_full = V_attn_vae  # No text values
         
-        V_full = torch.cat([text_v_structured, V_attn_vae], dim=1)  # [B, L_total, n_kv, 4*d_head]
         L_total = L_text_max + N_vae_max
 
         # Reshape for multi-head attention: [B, n_heads, L, d]
