@@ -470,6 +470,21 @@ class EPTAttentionMoT(nn.Module):
         H_out = out[..., :self.d_head].reshape(B, N_vae_max, self.n_q_heads * self.d_head)
         
         V_out_flat = out[..., self.d_head:].reshape(B, N_vae_max, self.n_q_heads, 3, self.d_head)
+        
+        # RESCALE VECTOR OUTPUT: Text tokens contribute zeros to vector portion, but they
+        # still consume attention mass (softmax sums to 1). This dilutes VAE vector contributions.
+        # We rescale by 1/(attention_to_VAE) to compensate.
+        # attn shape: [B, n_q, N_vae, L_total], VAE positions start at L_text_max
+        if L_text_max > 0:
+            # Sum attention going to VAE tokens: [B, n_q, N_vae]
+            attn_to_vae = attn[:, :, :, L_text_max:].sum(dim=-1)
+            # Clamp to avoid division by zero (happens when all attention goes to text)
+            attn_to_vae = attn_to_vae.clamp(min=1e-6)
+            # Rescale: [B, N_vae, n_q, 3, d_head] / [B, n_q, N_vae] -> need to align dims
+            # V_out_flat is [B, N_vae, n_q, 3, d_head], attn_to_vae is [B, n_q, N_vae]
+            scale = 1.0 / attn_to_vae.transpose(1, 2)  # [B, N_vae, n_q]
+            V_out_flat = V_out_flat * scale.unsqueeze(-1).unsqueeze(-1)  # [B, N_vae, n_q, 3, d_head]
+        
         V_out = V_out_flat.transpose(-2, -3).reshape(B, N_vae_max, 3, self.n_q_heads * self.d_head)
 
         # Output projections
