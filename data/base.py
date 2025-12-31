@@ -292,10 +292,14 @@ class BaseDataset(MMAPDataset):
                 # DEBUG: Use ground truth CDR sequence for QKV conditioning
                 # Override 'thinking' so collate_fn uses GT seq for <think>...</think>
                 # Also clear 'question' so QKV tokens don't attend to any prompt
-                data['response_qkv_text'] = summary.ref_seq
+                # 
+                # IMPORTANT: Add spaces between amino acids for 1:1 token-residue mapping!
+                # "CARGGN" -> "C A R G G N" ensures each amino acid = 1 token
+                spaced_seq = ' '.join(list(summary.ref_seq))
+                data['response_qkv_text'] = spaced_seq
                 if data.get('raw_text'):
                     data['raw_text'] = dict(data['raw_text'])  # Make a copy to avoid mutating cache
-                    data['raw_text']['thinking'] = summary.ref_seq  # GT seq becomes thinking content
+                    data['raw_text']['thinking'] = spaced_seq  # Spaced GT seq becomes thinking content
                     data['raw_text']['question'] = ""  # No prompt - QKV tokens are standalone
             elif self.use_answer_only_qkv:
                 # DEBUG: Use answer text for QKV conditioning

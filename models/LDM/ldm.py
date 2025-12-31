@@ -32,10 +32,13 @@ class LDMMolDesign(nn.Module):
             h_loss_weight=None,
             std=10.0,
             is_aa_corrupt_ratio=0.1,
-            diffusion_opt={}
+            diffusion_opt={},
+            text_injection_mode=False,  # NEW: Direct text injection instead of attention
+            text_embed_dim=128,  # Qwen3-4B head_dim * n_kv_heads flattened
         ):
         super().__init__()
         self.latent_deterministic = latent_deterministic
+        self.text_injection_mode = text_injection_mode
 
         self.autoencoder: CondIterAutoEncoder = torch.load(
             autoencoder_ckpt, map_location='cpu', weights_only=False
@@ -45,6 +48,18 @@ class LDMMolDesign(nn.Module):
         self.autoencoder.eval()
 
         latent_size = self.autoencoder.latent_size
+        
+        # Text injection: project pooled text embedding to latent space
+        # text_v shape: [B, L_text, n_kv_heads, head_dim] = [B, L, 8, 128]
+        # After flattening heads: [B, L, 8*128] = [B, L, 1024]
+        # After pooling: [B, 1024] -> project to [B, latent_size]
+        if text_injection_mode:
+            self.text_proj = nn.Sequential(
+                nn.Linear(text_embed_dim, hidden_size),
+                nn.SiLU(),
+                nn.Linear(hidden_size, latent_size),
+            )
+            print(f"📌 TEXT INJECTION MODE: Projecting text ({text_embed_dim}) → latent ({latent_size})")
 
         # topo embedding
         self.bond_embed = nn.Embedding(5, hidden_size) # [None, single, double, triple, aromatic]
@@ -99,6 +114,10 @@ class LDMMolDesign(nn.Module):
         '''
             Optional text conditioning via text_k, text_v, mask_text, text_lengths.
             When None, model behaves exactly as original UniMoMo.
+            
+            If text_injection_mode=True:
+            - Pools text_v, projects to latent space, adds directly to H_0
+            - No attention to text (text_k, text_v not passed to diffusion)
         '''
 
         # encode latent_H_0 (N*d) and latent_X_0 (N*3)
@@ -125,6 +144,56 @@ class LDMMolDesign(nn.Module):
 
         # condition embedding
         cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
+
+        # TEXT INJECTION MODE: Add text embedding directly to H_0
+        # With spaced GT seq, we have 1:1 token-residue mapping!
+        if self.text_injection_mode and text_v is not None and mask_text is not None:
+            # text_v: [B, L_text, n_kv_heads, head_dim] 
+            B, L_text, n_heads, head_dim = text_v.shape
+            batch_size = lengths.shape[0]
+            
+            # Flatten heads: [B, L_text, n_heads * head_dim]
+            text_v_flat = text_v.view(B, L_text, n_heads * head_dim)
+            
+            # Project each token to latent space: [B, L_text, latent_size]
+            text_latent = self.text_proj(text_v_flat)
+            
+            # Now we need to map tokens to residues
+            # Zh: [Nblock, latent_size] where Nblock = sum(lengths)
+            # Each sample has lengths[i] residues, and we have L_text tokens per sample
+            # With 1:1 mapping: tokens should match generate_mask residues
+            
+            # Find which residues are in generate_mask (CDR region)
+            # We'll add text embedding to generate_mask positions
+            offset = 0
+            for sample_idx in range(batch_size):
+                sample_len = int(lengths[sample_idx].item())
+                sample_mask = generate_mask[offset:offset + sample_len]  # [sample_len]
+                
+                # Count CDR residues in this sample
+                n_cdr = sample_mask.sum().item()
+                
+                # Get valid text tokens for this sample
+                n_tokens = int(mask_text[sample_idx].sum().item()) if mask_text is not None else L_text
+                
+                # Map tokens to CDR residues (1:1 if lengths match)
+                n_to_add = min(int(n_cdr), n_tokens)
+                
+                if n_to_add > 0:
+                    # Get CDR positions in this sample
+                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
+                    
+                    # Get text embeddings for this sample
+                    text_embed = text_latent[sample_idx, :n_to_add]  # [n_to_add, latent_size]
+                    
+                    # Add to Zh at CDR positions
+                    global_positions = offset + cdr_positions
+                    Zh[global_positions] = Zh[global_positions] + text_embed
+                
+                offset += sample_len
+            
+            # Disable attention to text (we're using direct injection)
+            text_k, text_v, mask_text, text_lengths = None, None, None, None
 
         loss_dict = self.diffusion.forward(
             H_0=Zh,
