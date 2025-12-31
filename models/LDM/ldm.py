@@ -34,7 +34,7 @@ class LDMMolDesign(nn.Module):
             is_aa_corrupt_ratio=0.1,
             diffusion_opt={},
             text_injection_mode=False,  # NEW: Direct text injection instead of attention
-            text_embed_dim=128,  # Qwen3-4B head_dim * n_kv_heads flattened
+            text_embed_dim=2560,  # Qwen3-4B hidden_size for per-residue embeddings
         ):
         super().__init__()
         self.latent_deterministic = latent_deterministic
@@ -49,10 +49,10 @@ class LDMMolDesign(nn.Module):
 
         latent_size = self.autoencoder.latent_size
         
-        # Text injection: project pooled text embedding to latent space
-        # text_v shape: [B, L_text, n_kv_heads, head_dim] = [B, L, 8, 128]
-        # After flattening heads: [B, L, 8*128] = [B, L, 1024]
-        # After pooling: [B, 1024] -> project to [B, latent_size]
+        # Text injection: project per-residue text embedding to latent space
+        # text_v shape: [B, L_text, hidden_dim] = [B, L, 2560] (Qwen hidden states)
+        # Each token = one amino acid (1:1 mapping)
+        # Project: [B, L, 2560] -> [B, L, latent_size]
         if text_injection_mode:
             self.text_proj = nn.Sequential(
                 nn.Linear(text_embed_dim, hidden_size),
@@ -146,39 +146,46 @@ class LDMMolDesign(nn.Module):
         cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
 
         # TEXT INJECTION MODE: Add text embedding directly to H_0
-        # With spaced GT seq, we have 1:1 token-residue mapping!
+        # Per-residue embeddings with 1:1 token-residue mapping!
         if self.text_injection_mode and text_v is not None and mask_text is not None:
-            # text_v: [B, L_text, n_kv_heads, head_dim] 
-            B, L_text, n_heads, head_dim = text_v.shape
-            batch_size = lengths.shape[0]
+            # text_v: [B, L_text, hidden_dim] - Qwen hidden states (per-residue)
+            # Each token = one amino acid residue
+            if text_v.dim() == 4:
+                # Old format: [B, L_text, n_heads, head_dim] -> flatten
+                B, L_text, n_heads, head_dim = text_v.shape
+                text_v_flat = text_v.view(B, L_text, n_heads * head_dim)
+            else:
+                # New format: [B, L_text, hidden_dim] - direct hidden states
+                B, L_text, hidden_dim = text_v.shape
+                text_v_flat = text_v
             
-            # Flatten heads: [B, L_text, n_heads * head_dim]
-            text_v_flat = text_v.view(B, L_text, n_heads * head_dim)
+            batch_size = lengths.shape[0]
             
             # Project each token to latent space: [B, L_text, latent_size]
             text_latent = self.text_proj(text_v_flat)
             
-            # Now we need to map tokens to residues
+            # Map tokens to residues 1:1
             # Zh: [Nblock, latent_size] where Nblock = sum(lengths)
-            # Each sample has lengths[i] residues, and we have L_text tokens per sample
-            # With 1:1 mapping: tokens should match generate_mask residues
+            # Each sample has lengths[i] residues
             
-            # Find which residues are in generate_mask (CDR region)
-            # We'll add text embedding to generate_mask positions
             offset = 0
             for sample_idx in range(batch_size):
                 sample_len = int(lengths[sample_idx].item())
                 sample_mask = generate_mask[offset:offset + sample_len]  # [sample_len]
                 
                 # Count CDR residues in this sample
-                n_cdr = sample_mask.sum().item()
+                n_cdr = int(sample_mask.sum().item())
                 
                 # Get valid text tokens for this sample
-                n_tokens = int(mask_text[sample_idx].sum().item()) if mask_text is not None else L_text
+                if text_lengths is not None:
+                    n_tokens = int(text_lengths[sample_idx].item())
+                elif mask_text is not None:
+                    n_tokens = int(mask_text[sample_idx].sum().item())
+                else:
+                    n_tokens = L_text
                 
-                # Map tokens to CDR residues (1:1 if lengths match)
-                n_to_add = min(int(n_cdr), n_tokens)
-                assert n_to_add == n_cdr, "n_to_add != n_cdr"
+                # 1:1 mapping: tokens should match CDR residues
+                n_to_add = min(n_cdr, n_tokens)
                 
                 if n_to_add > 0:
                     # Get CDR positions in this sample
