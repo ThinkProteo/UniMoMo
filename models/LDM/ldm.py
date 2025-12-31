@@ -162,6 +162,9 @@ class LDMMolDesign(nn.Module):
             batch_size = lengths.shape[0]
             
             # Project each token to latent space: [B, L_text, latent_size]
+            # Cast to same dtype as projection layer (Qwen outputs bfloat16, proj is float32)
+            proj_dtype = next(self.text_proj.parameters()).dtype
+            text_v_flat = text_v_flat.to(dtype=proj_dtype)
             text_latent = self.text_proj(text_v_flat)
             
             # Map tokens to residues 1:1
