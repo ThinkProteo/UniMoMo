@@ -178,6 +178,7 @@ class LDMMolDesign(nn.Module):
                 
                 # Map tokens to CDR residues (1:1 if lengths match)
                 n_to_add = min(int(n_cdr), n_tokens)
+                assert n_to_add == n_cdr, "n_to_add != n_cdr"
                 
                 if n_to_add > 0:
                     # Get CDR positions in this sample
