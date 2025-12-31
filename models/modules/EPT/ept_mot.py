@@ -247,6 +247,11 @@ class EPTAttentionMoT(nn.Module):
     - Text Keys are projected to match this expanded dimension
     - Values concatenate scalar (d_head) and vector (3*d_head) components
     """
+    
+    # Class-level debug settings
+    _debug_text_attn = False  # Set to True to print text attention stats
+    _debug_step_counter = 0
+    _debug_print_interval = 50  # Print every N forward passes
 
     def __init__(
         self,
@@ -461,6 +466,27 @@ class EPTAttentionMoT(nn.Module):
         # Compute attention (vanilla implementation)
         attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k)
         attn = F.softmax(attn_scores * self.scale_factor + bias_full, dim=-1)
+        
+        # DEBUG: Print text attention stats for GT seq debugging
+        if L_text_max > 0 and EPTAttentionMoT._debug_text_attn:
+            EPTAttentionMoT._debug_step_counter += 1
+            if EPTAttentionMoT._debug_step_counter % EPTAttentionMoT._debug_print_interval == 1:
+                # attn shape: [B, n_q, N_vae, L_total]
+                # Text tokens are at positions 0:L_text_max
+                attn_to_text = attn[:, :, :, :L_text_max].sum(dim=-1)  # [B, n_q, N_vae]
+                attn_to_vae = attn[:, :, :, L_text_max:].sum(dim=-1)   # [B, n_q, N_vae]
+                
+                # Compute stats across batch and heads
+                text_attn_mean = attn_to_text.mean().item()
+                text_attn_max = attn_to_text.max().item()
+                text_attn_min = attn_to_text.min().item()
+                vae_attn_mean = attn_to_vae.mean().item()
+                
+                print(f"📊 [Layer {self.layer_idx}] Text Attention Stats (step {EPTAttentionMoT._debug_step_counter}):")
+                print(f"   Attn to TEXT: mean={text_attn_mean:.4f}, max={text_attn_max:.4f}, min={text_attn_min:.4f}")
+                print(f"   Attn to VAE:  mean={vae_attn_mean:.4f}")
+                print(f"   Text tokens: {L_text_max}, VAE tokens: {N_vae_max}")
+        
         out = torch.einsum('bhqk,bhkd->bhqd', attn, v)  # [B, n_q, N_vae, 4*d_head]
 
         # Reshape output: [B, n_q, N_vae, 4*d_head] -> [B, N_vae, n_q, 4*d_head]
