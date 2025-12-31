@@ -171,6 +171,14 @@ class LDMMolDesign(nn.Module):
             # Zh: [Nblock, latent_size] where Nblock = sum(lengths)
             # Each sample has lengths[i] residues
             
+            # DEBUG: Print text injection stats
+            _debug_injection = getattr(self, '_debug_text_injection', False)
+            if _debug_injection:
+                print(f"\n🔍 TEXT INJECTION DEBUG - LDM:")
+                print(f"  text_v shape: {text_v.shape}, text_latent shape: {text_latent.shape}")
+                print(f"  text_latent stats: mean={text_latent.mean():.4f}, std={text_latent.std():.4f}")
+                print(f"  Zh (before injection) stats: mean={Zh.mean():.4f}, std={Zh.std():.4f}")
+            
             offset = 0
             for sample_idx in range(batch_size):
                 sample_len = int(lengths[sample_idx].item())
@@ -190,6 +198,9 @@ class LDMMolDesign(nn.Module):
                 # 1:1 mapping: tokens should match CDR residues
                 n_to_add = min(n_cdr, n_tokens)
                 
+                if _debug_injection and sample_idx < 2:
+                    print(f"  Sample {sample_idx}: n_cdr={n_cdr}, n_tokens={n_tokens}, n_to_add={n_to_add}")
+                
                 if n_to_add > 0:
                     # Get CDR positions in this sample
                     cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
@@ -202,6 +213,9 @@ class LDMMolDesign(nn.Module):
                     Zh[global_positions] = Zh[global_positions] + text_embed
                 
                 offset += sample_len
+            
+            if _debug_injection:
+                print(f"  Zh (after injection) stats: mean={Zh.mean():.4f}, std={Zh.std():.4f}")
             
             # Disable attention to text (we're using direct injection)
             text_k, text_v, mask_text, text_lengths = None, None, None, None

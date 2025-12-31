@@ -208,6 +208,21 @@ class FullDPM(nn.Module):
             loss_dict = {}
             loss_dict['X'] = loss_X.sum() / (generate_mask.sum().float() + 1e-8)
             loss_dict['H'] = loss_H.sum() / (generate_mask.sum().float() + 1e-8)
+            
+            # DEBUG: Print H loss details
+            _debug_h_loss = getattr(self, '_debug_text_injection', False)
+            if _debug_h_loss:
+                with torch.no_grad():
+                    n_gen = generate_mask.sum().item()
+                    print(f"\n🔍 H LOSS DEBUG (v-prediction mode):")
+                    print(f"  timestep t: {t.tolist()}")
+                    print(f"  H_0 (target) stats: mean={H_0[generate_mask].mean():.4f}, std={H_0[generate_mask].std():.4f}")
+                    print(f"  H_0_pred stats: mean={H_0_pred[generate_mask].mean():.4f}, std={H_0_pred[generate_mask].std():.4f}")
+                    print(f"  H_noisy stats: mean={H_noisy[generate_mask].mean():.4f}, std={H_noisy[generate_mask].std():.4f}")
+                    # Compute per-residue MSE between H_0 and H_0_pred
+                    h_mse = F.mse_loss(H_0_pred[generate_mask], H_0[generate_mask], reduction='none').mean(dim=-1)
+                    print(f"  H_0_pred vs H_0 MSE (per residue): mean={h_mse.mean():.4f}, max={h_mse.max():.4f}")
+                    print(f"  Final H loss: {loss_dict['H']:.4f}, n_gen={n_gen}")
 
         else:
             # --- Standard Epsilon Pred ---
