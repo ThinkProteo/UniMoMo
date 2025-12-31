@@ -48,18 +48,19 @@ class LDMMolDesign(nn.Module):
         self.autoencoder.eval()
 
         latent_size = self.autoencoder.latent_size
+        self.hidden_size = hidden_size  # Save for text projection
         
-        # Text injection: project per-residue text embedding to latent space
+        # Text injection: project per-residue text embedding to cond_embedding space
         # text_v shape: [B, L_text, hidden_dim] = [B, L, 2560] (Qwen hidden states)
         # Each token = one amino acid (1:1 mapping)
-        # Project: [B, L, 2560] -> [B, L, latent_size]
+        # Project: [B, L, 2560] -> [B, L, hidden_size] (to match cond_embedding)
         if text_injection_mode:
             self.text_proj = nn.Sequential(
                 nn.Linear(text_embed_dim, hidden_size),
                 nn.SiLU(),
-                nn.Linear(hidden_size, latent_size),
+                nn.Linear(hidden_size, hidden_size),  # Output to hidden_size for cond_embedding
             )
-            print(f"📌 TEXT INJECTION MODE: Projecting text ({text_embed_dim}) → latent ({latent_size})")
+            print(f"📌 TEXT INJECTION MODE: Projecting text ({text_embed_dim}) → cond_embedding ({hidden_size})")
 
         # topo embedding
         self.bond_embed = nn.Embedding(5, hidden_size) # [None, single, double, triple, aromatic]
@@ -145,8 +146,9 @@ class LDMMolDesign(nn.Module):
         # condition embedding
         cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
 
-        # TEXT INJECTION MODE: Add text embedding directly to H_0
+        # TEXT INJECTION MODE: Add text embedding to cond_embedding (conditioning signal)
         # Per-residue embeddings with 1:1 token-residue mapping!
+        # This conditions the denoising process without modifying the target H_0
         if self.text_injection_mode and text_v is not None and mask_text is not None:
             # text_v: [B, L_text, hidden_dim] - Qwen hidden states (per-residue)
             # Each token = one amino acid residue
@@ -156,28 +158,27 @@ class LDMMolDesign(nn.Module):
                 text_v_flat = text_v.view(B, L_text, n_heads * head_dim)
             else:
                 # New format: [B, L_text, hidden_dim] - direct hidden states
-                B, L_text, hidden_dim = text_v.shape
+                B, L_text, text_hidden_dim = text_v.shape
                 text_v_flat = text_v
             
             batch_size = lengths.shape[0]
             
-            # Project each token to latent space: [B, L_text, latent_size]
+            # Project each token to cond_embedding space: [B, L_text, hidden_size]
             # Cast to same dtype as projection layer (Qwen outputs bfloat16, proj is float32)
             proj_dtype = next(self.text_proj.parameters()).dtype
             text_v_flat = text_v_flat.to(dtype=proj_dtype)
-            text_latent = self.text_proj(text_v_flat)
+            text_cond = self.text_proj(text_v_flat)  # [B, L_text, hidden_size]
             
             # Map tokens to residues 1:1
-            # Zh: [Nblock, latent_size] where Nblock = sum(lengths)
-            # Each sample has lengths[i] residues
+            # cond_embedding: [Nblock, hidden_size] where Nblock = sum(lengths)
             
             # DEBUG: Print text injection stats
             _debug_injection = getattr(self, '_debug_text_injection', False)
             if _debug_injection:
-                print(f"\n🔍 TEXT INJECTION DEBUG - LDM:")
-                print(f"  text_v shape: {text_v.shape}, text_latent shape: {text_latent.shape}")
-                print(f"  text_latent stats: mean={text_latent.mean():.4f}, std={text_latent.std():.4f}")
-                print(f"  Zh (before injection) stats: mean={Zh.mean():.4f}, std={Zh.std():.4f}")
+                print(f"\n🔍 TEXT INJECTION DEBUG - LDM (cond_embedding mode):")
+                print(f"  text_v shape: {text_v.shape}, text_cond shape: {text_cond.shape}")
+                print(f"  text_cond stats: mean={text_cond.mean():.4f}, std={text_cond.std():.4f}")
+                print(f"  cond_embedding (before) stats: mean={cond_embedding.mean():.4f}, std={cond_embedding.std():.4f}")
             
             offset = 0
             for sample_idx in range(batch_size):
@@ -206,16 +207,16 @@ class LDMMolDesign(nn.Module):
                     cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
                     
                     # Get text embeddings for this sample
-                    text_embed = text_latent[sample_idx, :n_to_add]  # [n_to_add, latent_size]
+                    text_embed = text_cond[sample_idx, :n_to_add]  # [n_to_add, hidden_size]
                     
-                    # Add to Zh at CDR positions
+                    # Add to cond_embedding at CDR positions (conditioning signal)
                     global_positions = offset + cdr_positions
-                    Zh[global_positions] = Zh[global_positions] + text_embed
+                    cond_embedding[global_positions] = cond_embedding[global_positions] + text_embed
                 
                 offset += sample_len
             
             if _debug_injection:
-                print(f"  Zh (after injection) stats: mean={Zh.mean():.4f}, std={Zh.std():.4f}")
+                print(f"  cond_embedding (after) stats: mean={cond_embedding.mean():.4f}, std={cond_embedding.std():.4f}")
             
             # Disable attention to text (we're using direct injection)
             text_k, text_v, mask_text, text_lengths = None, None, None, None
@@ -357,6 +358,46 @@ class LDMMolDesign(nn.Module):
         
         # condition embedding
         cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
+        
+        # TEXT INJECTION MODE: Add text embedding to cond_embedding during sampling
+        if self.text_injection_mode and text_v is not None and mask_text is not None:
+            if text_v.dim() == 4:
+                B, L_text, n_heads, head_dim = text_v.shape
+                text_v_flat = text_v.view(B, L_text, n_heads * head_dim)
+            else:
+                B, L_text, text_hidden_dim = text_v.shape
+                text_v_flat = text_v
+            
+            batch_size = lengths.shape[0]
+            proj_dtype = next(self.text_proj.parameters()).dtype
+            text_v_flat = text_v_flat.to(dtype=proj_dtype)
+            text_cond = self.text_proj(text_v_flat)  # [B, L_text, hidden_size]
+            
+            offset = 0
+            for sample_idx in range(batch_size):
+                sample_len = int(lengths[sample_idx].item())
+                sample_mask = generate_mask[offset:offset + sample_len]
+                n_cdr = int(sample_mask.sum().item())
+                
+                if text_lengths is not None:
+                    n_tokens = int(text_lengths[sample_idx].item())
+                elif mask_text is not None:
+                    n_tokens = int(mask_text[sample_idx].sum().item())
+                else:
+                    n_tokens = L_text
+                
+                n_to_add = min(n_cdr, n_tokens)
+                
+                if n_to_add > 0:
+                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
+                    text_embed = text_cond[sample_idx, :n_to_add]
+                    global_positions = offset + cdr_positions
+                    cond_embedding[global_positions] = cond_embedding[global_positions] + text_embed
+                
+                offset += sample_len
+            
+            # In text injection mode, we don't use attention
+            text_k, text_v, mask_text, text_lengths = None, None, None, None
         
         traj = self.diffusion.sample(
             H=Zh,
