@@ -216,7 +216,7 @@ def run_basic_metrics(task: Task):
     gen_seq = ''.join([VOCAB.abrv_to_symbol(block.name) for block in gen_blocks])
     ref_seq = ''.join([VOCAB.abrv_to_symbol(block.name) for block in ref_blocks]) 
 
-    #print('gen_seq, ref_seq:, is_match:', gen_seq, ref_seq, gen_seq == ref_seq)
+    print('gen_seq, ref_seq:, is_match:', gen_seq, ref_seq, gen_seq == ref_seq)
 
     # set sequence
     task.seq = gen_seq
