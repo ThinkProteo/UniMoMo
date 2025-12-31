@@ -301,6 +301,12 @@ class EPTAttentionMoT(nn.Module):
         # Text Key projection: d_head -> 4*d_head to match VAE K dimension
         # diffusion match to text; not the other way around!!
         # self.text_k_proj = nn.Linear(self.d_head, self.d_qk_head, bias=False)
+        
+        # Text Value projection: maps Qwen's head_dim to EPT's scalar d_head
+        # Text values are pure scalar embeddings (no geometric vector component)
+        # We project them to d_head and pad with zeros for the vector portion
+        # Qwen3-4B head_dim=128, EPT d_head varies based on config
+        self.text_v_proj = nn.Linear(self.d_qk_head, self.d_head, bias=False)
 
         # Output projections
         self.scaler_o = nn.Linear(self.n_q_heads * self.d_head, d_hidden)
@@ -379,7 +385,24 @@ class EPTAttentionMoT(nn.Module):
 
         # Concatenate text and VAE K/V along sequence dimension
         K_full = torch.cat([text_k, H_k_vae], dim=1)  # [B, L_total, n_kv, d_qk_head]
-        V_full = torch.cat([text_v, V_attn_vae], dim=1)  # [B, L_total, n_kv, 4*d_head]
+        
+        # CRITICAL FIX: Text values are pure scalar embeddings (Qwen head_dim), but EPT 
+        # expects values with [scalar(d_head) + 3*vector(3*d_head)] = 4*d_head structure.
+        # We project text_v to scalar portion only, padding vector portion with zeros.
+        # This prevents text embeddings from being incorrectly interpreted as 3D vectors.
+        if L_text_max > 0 and text_v is not None:
+            # text_v: [B, L, n_kv, qwen_head_dim] -> project to [B, L, n_kv, d_head] for scalar
+            # Then pad with zeros for vector portion: [B, L, n_kv, 4*d_head]
+            text_v_scalar = self.text_v_proj(text_v)  # Learned projection to d_head
+            text_v_vector_pad = torch.zeros(
+                B, L_text_max, self.n_kv_heads, 3 * self.d_head, 
+                device=device, dtype=text_v.dtype
+            )  # Zero vector contribution
+            text_v_structured = torch.cat([text_v_scalar, text_v_vector_pad], dim=-1)
+        else:
+            text_v_structured = text_v
+        
+        V_full = torch.cat([text_v_structured, V_attn_vae], dim=1)  # [B, L_total, n_kv, 4*d_head]
         L_total = L_text_max + N_vae_max
 
         # Reshape for multi-head attention: [B, n_heads, L, d]

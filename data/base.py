@@ -291,18 +291,22 @@ class BaseDataset(MMAPDataset):
             if self.use_gt_seq:
                 # DEBUG: Use ground truth CDR sequence for QKV conditioning
                 # Override 'thinking' so collate_fn uses GT seq for <think>...</think>
+                # Also clear 'question' so QKV tokens don't attend to any prompt
                 data['response_qkv_text'] = summary.ref_seq
                 if data.get('raw_text'):
                     data['raw_text'] = dict(data['raw_text'])  # Make a copy to avoid mutating cache
                     data['raw_text']['thinking'] = summary.ref_seq  # GT seq becomes thinking content
+                    data['raw_text']['question'] = ""  # No prompt - QKV tokens are standalone
             elif self.use_answer_only_qkv:
                 # DEBUG: Use answer text for QKV conditioning
                 # Override 'thinking' with answer so QKV extracts from answer tokens
+                # Also clear 'question' so QKV tokens don't attend to any prompt
                 answer_text = data.get('raw_text', {}).get('answer', '') if data.get('raw_text') else ''
                 data['response_qkv_text'] = answer_text
                 if data.get('raw_text'):
                     data['raw_text'] = dict(data['raw_text'])  # Make a copy
                     data['raw_text']['thinking'] = answer_text  # Answer becomes thinking content
+                    data['raw_text']['question'] = ""  # No prompt - QKV tokens are standalone
             else:
                 data['response_qkv_text'] = self._find_response_qkv(summary.id)
 
