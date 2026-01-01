@@ -71,7 +71,7 @@ class LDMMolDesign(nn.Module):
             # Auxiliary projection: text → H_0 (VAE latent) for direct supervision
             # This gives text_proj a direct learning signal
             self.text_h0_proj = nn.Linear(hidden_size, latent_size)
-            self.aux_loss_weight = 0.1  # Weight for auxiliary loss
+            self.aux_loss_weight = 1.0  # Weight for auxiliary loss (increased from 0.1)
             
             print(f"📌 TEXT INJECTION MODE: Projecting text ({text_embed_dim}) → cond ({hidden_size}) + H_0 ({latent_size})")
 
