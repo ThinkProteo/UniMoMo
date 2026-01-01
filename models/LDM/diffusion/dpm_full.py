@@ -210,7 +210,7 @@ class FullDPM(nn.Module):
             loss_dict['H'] = loss_H.sum() / (generate_mask.sum().float() + 1e-8)
 
         else:
-            # --- Standard Epsilon Pred ---
+            # --- Standard Epsilon Pred with Min-SNR Weighting ---
             batch_ids = length_to_batch_id(lengths)
             batch_size = batch_ids.max() + 1
             if t is None: # sample time step
@@ -227,25 +227,34 @@ class FullDPM(nn.Module):
                 text_k=text_k, text_v=text_v, mask_text=mask_text, text_lengths=text_lengths
             )
 
+            # Min-SNR weighting: balance loss across timesteps
+            # SNR = alpha_bar / (1 - alpha_bar), weight = min(SNR, gamma) / SNR
+            snr_gamma = 5.0  # typical value from Min-SNR paper
+            alpha_bar = self.trans_h.var_sched.alpha_bars[t]  # [batch_size]
+            snr = alpha_bar / (1 - alpha_bar + 1e-8)  # [batch_size]
+            snr_weight = torch.clamp(snr, max=snr_gamma) / (snr + 1e-8)  # [batch_size]
+            snr_weight_per_node = snr_weight[batch_ids]  # [N]
+
             loss_dict = {}
 
-            # equivariant vector feature loss
-            loss_X = F.mse_loss(eps_X_pred[generate_mask], eps_X[generate_mask], reduction='none').sum(dim=-1)  # (Ntgt * n_latent_channel)
-            loss_X = loss_X.sum() / (generate_mask.sum().float() + 1e-8)
-            loss_dict['X'] = loss_X
+            # equivariant vector feature loss (with Min-SNR weighting)
+            loss_X_raw = F.mse_loss(eps_X_pred[generate_mask], eps_X[generate_mask], reduction='none').sum(dim=-1)  # [Ntgt]
+            loss_X_weighted = (loss_X_raw * snr_weight_per_node[generate_mask]).sum() / (generate_mask.sum().float() + 1e-8)
+            loss_dict['X'] = loss_X_weighted
 
-            # invariant scalar feature loss
-            loss_H = F.mse_loss(eps_H_pred[generate_mask], eps_H[generate_mask], reduction='none').sum(dim=-1)  # [N]
-            loss_H = loss_H.sum() / (generate_mask.sum().float() + 1e-8)
-            loss_dict['H'] = loss_H
+            # invariant scalar feature loss (with Min-SNR weighting)
+            loss_H_raw = F.mse_loss(eps_H_pred[generate_mask], eps_H[generate_mask], reduction='none').sum(dim=-1)  # [Ntgt]
+            loss_H_weighted = (loss_H_raw * snr_weight_per_node[generate_mask]).sum() / (generate_mask.sum().float() + 1e-8)
+            loss_dict['H'] = loss_H_weighted
 
             # DEBUG: Print H loss details
-            _debug_h_loss = True #getattr(self, '_debug_text_injection', False)
+            _debug_h_loss = False  # Set to True for debugging
             if _debug_h_loss:
                 with torch.no_grad():
                     n_gen = generate_mask.sum().item()
-                    print(f"\n🔍 H LOSS DEBUG (epsilon-prediction mode):")
+                    print(f"\n🔍 H LOSS DEBUG (epsilon-prediction + Min-SNR):")
                     print(f"  timestep t: {t.tolist()}")
+                    print(f"  SNR: {snr.tolist()}, weights: {snr_weight.tolist()}")
                     print(f"  H_0 (clean target) stats: mean={H_0[generate_mask].mean():.4f}, std={H_0[generate_mask].std():.4f}")
                     print(f"  eps_H (noise target) stats: mean={eps_H[generate_mask].mean():.4f}, std={eps_H[generate_mask].std():.4f}")
                     print(f"  eps_H_pred stats: mean={eps_H_pred[generate_mask].mean():.4f}, std={eps_H_pred[generate_mask].std():.4f}")
@@ -253,7 +262,8 @@ class FullDPM(nn.Module):
                     # Compute per-residue MSE between eps_H_pred and eps_H
                     h_mse = F.mse_loss(eps_H_pred[generate_mask], eps_H[generate_mask], reduction='none').mean(dim=-1)
                     print(f"  eps_H_pred vs eps_H MSE (per residue): mean={h_mse.mean():.4f}, max={h_mse.max():.4f}")
-                    print(f"  Final H loss: {loss_dict['H']:.4f}, n_gen={n_gen}")
+                    print(f"  Raw H loss: {loss_H_raw.sum() / (generate_mask.sum().float() + 1e-8):.4f}")
+                    print(f"  Weighted H loss: {loss_dict['H']:.4f}, n_gen={n_gen}")
         return loss_dict
 
     @torch.no_grad()

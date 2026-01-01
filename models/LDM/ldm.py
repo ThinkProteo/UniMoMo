@@ -60,6 +60,9 @@ class LDMMolDesign(nn.Module):
                 nn.SiLU(),
                 nn.Linear(hidden_size, hidden_size),  # Output to hidden_size for cond_embedding
             )
+            # Learnable scaling factor for text conditioning strength
+            # Initialize to 0.1 to start conservatively (cond_embedding has std≈0.02)
+            self.text_scale = nn.Parameter(torch.tensor(0.1))
             print(f"📌 TEXT INJECTION MODE: Projecting text ({text_embed_dim}) → cond_embedding ({hidden_size})")
 
         # topo embedding
@@ -173,7 +176,7 @@ class LDMMolDesign(nn.Module):
             # cond_embedding: [Nblock, hidden_size] where Nblock = sum(lengths)
             
             # DEBUG: Print text injection stats
-            _debug_injection = getattr(self, '_debug_text_injection', False)
+            _debug_injection = False  # Set to True for debugging
             if _debug_injection:
                 print(f"\n🔍 TEXT INJECTION DEBUG - LDM (cond_embedding mode):")
                 print(f"  text_v shape: {text_v.shape}, text_cond shape: {text_cond.shape}")
@@ -210,12 +213,14 @@ class LDMMolDesign(nn.Module):
                     text_embed = text_cond[sample_idx, :n_to_add]  # [n_to_add, hidden_size]
                     
                     # Add to cond_embedding at CDR positions (conditioning signal)
+                    # Apply learnable scaling to balance text signal with other conditioning
                     global_positions = offset + cdr_positions
-                    cond_embedding[global_positions] = cond_embedding[global_positions] + text_embed
+                    cond_embedding[global_positions] = cond_embedding[global_positions] + self.text_scale * text_embed
                 
                 offset += sample_len
             
             if _debug_injection:
+                print(f"  text_scale: {self.text_scale.item():.4f}")
                 print(f"  cond_embedding (after) stats: mean={cond_embedding.mean():.4f}, std={cond_embedding.std():.4f}")
             
             # Disable attention to text (we're using direct injection)
@@ -392,7 +397,7 @@ class LDMMolDesign(nn.Module):
                     cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
                     text_embed = text_cond[sample_idx, :n_to_add]
                     global_positions = offset + cdr_positions
-                    cond_embedding[global_positions] = cond_embedding[global_positions] + text_embed
+                    cond_embedding[global_positions] = cond_embedding[global_positions] + self.text_scale * text_embed
                 
                 offset += sample_len
             
