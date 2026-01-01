@@ -243,6 +243,10 @@ class LDMMolDesign(nn.Module):
         # loss - RESTORED: Original UniMoMo formula with h_loss_weight
         loss_dict['total'] = loss_dict['H'] * self.h_loss_weight + loss_dict['X']
 
+        # Log text_scale if using text injection mode
+        if self.text_injection_mode and hasattr(self, 'text_scale'):
+            loss_dict['text_scale'] = self.text_scale.detach()
+
         return loss_dict
 
     # def latent_geometry_guidance(self, X, generate_mask, batch_ids, tolerance=3, **kwargs):
