@@ -2,6 +2,7 @@
 # -*- coding:utf-8 -*-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_scatter import scatter_mean
 
 # Disable TF32 to avoid CUBLAS errors on H100/H200 GPUs
@@ -66,7 +67,13 @@ class LDMMolDesign(nn.Module):
             # If model finds text unhelpful, it can learn to reduce this
             self.text_scale = nn.Parameter(torch.tensor(1.0))
             self._text_scale_init = 1.0  # Track initial value for reset
-            print(f"📌 TEXT INJECTION MODE: Projecting text ({text_embed_dim}) → cond_embedding ({hidden_size})")
+            
+            # Auxiliary projection: text → H_0 (VAE latent) for direct supervision
+            # This gives text_proj a direct learning signal
+            self.text_h0_proj = nn.Linear(hidden_size, latent_size)
+            self.aux_loss_weight = 0.1  # Weight for auxiliary loss
+            
+            print(f"📌 TEXT INJECTION MODE: Projecting text ({text_embed_dim}) → cond ({hidden_size}) + H_0 ({latent_size})")
 
         # topo embedding
         self.bond_embed = nn.Embedding(5, hidden_size) # [None, single, double, triple, aromatic]
@@ -233,6 +240,55 @@ class LDMMolDesign(nn.Module):
                 print(f"  text_scale: {self.text_scale.item():.4f}")
                 print(f"  cond_embedding (after) stats: mean={cond_embedding.mean():.4f}, std={cond_embedding.std():.4f}")
             
+            # AUXILIARY LOSS: Direct supervision for text_proj
+            # Predict H_0 (VAE latent) from text embeddings
+            text_h0_pred = self.text_h0_proj(text_cond)  # [B, L_text, latent_size]
+            
+            # Collect targets and predictions for auxiliary loss
+            aux_preds = []
+            aux_targets = []
+            offset = 0
+            for sample_idx in range(batch_size):
+                sample_len = int(lengths[sample_idx].item())
+                sample_mask = generate_mask[offset:offset + sample_len]
+                n_cdr = int(sample_mask.sum().item())
+                
+                if text_lengths is not None:
+                    n_tokens = int(text_lengths[sample_idx].item())
+                elif mask_text is not None:
+                    n_tokens = int(mask_text[sample_idx].sum().item())
+                else:
+                    n_tokens = text_h0_pred.shape[1]
+                
+                n_to_match = min(n_cdr, n_tokens)
+                if n_to_match > 0:
+                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_match]
+                    global_positions = offset + cdr_positions
+                    
+                    # Target: H_0 at CDR positions
+                    h0_target = Zh[global_positions]  # [n_to_match, latent_size]
+                    # Prediction: text_h0_proj output
+                    h0_pred = text_h0_pred[sample_idx, :n_to_match]  # [n_to_match, latent_size]
+                    
+                    aux_preds.append(h0_pred)
+                    aux_targets.append(h0_target)
+                
+                offset += sample_len
+            
+            # Compute auxiliary loss
+            if aux_preds:
+                aux_preds_cat = torch.cat(aux_preds, dim=0)
+                aux_targets_cat = torch.cat(aux_targets, dim=0)
+                aux_loss = F.mse_loss(aux_preds_cat, aux_targets_cat)
+                
+                if _debug_injection:
+                    print(f"  🎯 AUX LOSS: {aux_loss.item():.4f} (direct text→H_0 supervision)")
+            else:
+                aux_loss = torch.tensor(0.0, device=Zh.device)
+            
+            # Store for later addition to total loss
+            self._aux_loss = aux_loss
+            
             # Disable attention to text (we're using direct injection)
             text_k, text_v, mask_text, text_lengths = None, None, None, None
 
@@ -252,6 +308,13 @@ class LDMMolDesign(nn.Module):
 
         # loss - RESTORED: Original UniMoMo formula with h_loss_weight
         loss_dict['total'] = loss_dict['H'] * self.h_loss_weight + loss_dict['X']
+
+        # Add auxiliary loss for text injection mode (direct text→H_0 supervision)
+        if self.text_injection_mode and hasattr(self, '_aux_loss'):
+            aux_loss = self._aux_loss
+            loss_dict['aux_loss'] = aux_loss
+            loss_dict['total'] = loss_dict['total'] + self.aux_loss_weight * aux_loss
+            del self._aux_loss  # Clean up
 
         # Log text_scale if using text injection mode
         if self.text_injection_mode and hasattr(self, 'text_scale'):
