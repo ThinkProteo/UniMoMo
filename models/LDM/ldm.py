@@ -122,23 +122,26 @@ class LDMMolDesign(nn.Module):
                 
                 esm_embed_dim = 1280  # ESM-2 650M hidden size
                 
-                # Project ESM to H_0 space for DIRECT sequence prediction (with aux_loss)
-                # This is the key connection to the diffusion model head!
-                self.esm_h0_proj = nn.Sequential(
-                    nn.Linear(esm_embed_dim, hidden_size),
-                    nn.SiLU(),
-                    nn.Linear(hidden_size, latent_size),
-                )
-                # Initialize output layer with small weights to match H_0 scale (~0.35 std)
-                nn.init.normal_(self.esm_h0_proj[-1].weight, mean=0.0, std=0.1)
-                nn.init.zeros_(self.esm_h0_proj[-1].bias)
+                # ARCHITECTURE: ESM → esm_cond_proj → esm_cond → esm_h0_proj → H_0
+                # This creates a CHAINED projection where gradients flow through both
                 
-                # Project ESM to cond_embedding space for structural conditioning
+                # Step 1: Project ESM to cond_embedding space (shared representation)
                 self.esm_cond_proj = nn.Sequential(
                     nn.Linear(esm_embed_dim, hidden_size),
                     nn.SiLU(),
                     nn.Linear(hidden_size, hidden_size),
                 )
+                
+                # Step 2: Project cond to H_0 space (for aux_loss and H_prior)
+                # Takes esm_cond (hidden_size) as input, NOT raw ESM embeddings!
+                self.esm_h0_proj = nn.Sequential(
+                    nn.Linear(hidden_size, hidden_size // 2),
+                    nn.SiLU(),
+                    nn.Linear(hidden_size // 2, latent_size),
+                )
+                # Initialize output layer with small weights to match H_0 scale (~0.35 std)
+                nn.init.normal_(self.esm_h0_proj[-1].weight, mean=0.0, std=0.1)
+                nn.init.zeros_(self.esm_h0_proj[-1].bias)
                 
                 # Scaling factor for ESM contribution to cond_embedding
                 self.esm_scale = nn.Parameter(torch.tensor(1.0))
@@ -146,9 +149,10 @@ class LDMMolDesign(nn.Module):
                 # Auxiliary loss weight (direct ESM → H_0 prediction)
                 self.aux_loss_weight = 1.0
                 
-                print(f"📌 ESM EMBED MODE:")
-                print(f"   - ESM-2 ({esm_embed_dim}) → H_0 ({latent_size}) with aux_loss (sequence)")
-                print(f"   - ESM-2 ({esm_embed_dim}) → cond ({hidden_size}) (structure context)")
+                print(f"📌 ESM EMBED MODE (chained projection):")
+                print(f"   - ESM-2 ({esm_embed_dim}) → esm_cond_proj → cond ({hidden_size})")
+                print(f"   - cond ({hidden_size}) → esm_h0_proj → H_0 ({latent_size})")
+                print(f"   - Gradients flow: aux_loss → esm_h0_proj → esm_cond_proj")
             except ImportError:
                 print("⚠️ ESM not installed! Run: pip install fair-esm")
                 self.use_esm_embed = False
@@ -456,11 +460,12 @@ class LDMMolDesign(nn.Module):
             batch_size = lengths.shape[0]
             B, L_esm, esm_dim = esm_embeddings.shape
             
-            # Project ESM embeddings to both H_0 and cond spaces
+            # CHAINED projection: ESM → esm_cond → esm_h0_pred
+            # Gradients from aux_loss flow through BOTH projections
             proj_dtype = next(self.esm_cond_proj.parameters()).dtype
             esm_embeddings = esm_embeddings.to(dtype=proj_dtype)
-            esm_h0_pred = self.esm_h0_proj(esm_embeddings)  # [B, L_esm, latent_size]
             esm_cond = self.esm_cond_proj(esm_embeddings)   # [B, L_esm, hidden_size]
+            esm_h0_pred = self.esm_h0_proj(esm_cond)        # [B, L_esm, latent_size]
             
             # DEBUG
             _debug_esm = True
@@ -758,11 +763,11 @@ class LDMMolDesign(nn.Module):
             batch_size = lengths.shape[0]
             B, L_esm, esm_dim = esm_embeddings.shape
             
-            # Project ESM embeddings to both H_0 and cond spaces
+            # CHAINED projection: ESM → esm_cond → esm_h0_pred
             proj_dtype = next(self.esm_cond_proj.parameters()).dtype
             esm_embeddings = esm_embeddings.to(dtype=proj_dtype)
-            esm_h0_pred = self.esm_h0_proj(esm_embeddings)  # [B, L_esm, latent_size] - trained to predict H_0!
             esm_cond = self.esm_cond_proj(esm_embeddings)   # [B, L_esm, hidden_size]
+            esm_h0_pred = self.esm_h0_proj(esm_cond)        # [B, L_esm, latent_size] - trained to predict H_0!
             
             # Initialize H_prior with zeros, then fill with ESM predictions at CDR positions
             H_prior = torch.zeros_like(Zh)
