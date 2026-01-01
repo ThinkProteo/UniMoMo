@@ -36,10 +36,12 @@ class LDMMolDesign(nn.Module):
             diffusion_opt={},
             text_injection_mode=False,  # NEW: Direct text injection instead of attention
             text_embed_dim=2560,  # Qwen3-4B hidden_size for per-residue embeddings
+            use_learned_aa_embed=False,  # NEW: Use simple learned AA embeddings instead of Qwen
         ):
         super().__init__()
         self.latent_deterministic = latent_deterministic
         self.text_injection_mode = text_injection_mode
+        self.use_learned_aa_embed = use_learned_aa_embed
 
         self.autoencoder: CondIterAutoEncoder = torch.load(
             autoencoder_ckpt, map_location='cpu', weights_only=False
@@ -74,6 +76,27 @@ class LDMMolDesign(nn.Module):
             self.aux_loss_weight = 1.0  # Weight for auxiliary loss (increased from 0.1)
             
             print(f"📌 TEXT INJECTION MODE: Projecting text ({text_embed_dim}) → cond ({hidden_size}) + H_0 ({latent_size})")
+        
+        # SIMPLE LEARNED AA EMBEDDINGS - Alternative to Qwen
+        # This gives the model a direct, fully learnable mapping: AA → H_0
+        if use_learned_aa_embed:
+            # Standard amino acid vocabulary: A C D E F G H I K L M N P Q R S T V W Y + X (unknown)
+            self.aa_vocab = "ACDEFGHIKLMNPQRSTVWYX"  # 21 amino acids
+            self.aa_to_idx = {aa: i for i, aa in enumerate(self.aa_vocab)}
+            
+            # Direct embedding to VAE latent space (not hidden_size!)
+            # This is the simplest possible shortcut: AA → H_0
+            self.aa_embed = nn.Embedding(21, latent_size)
+            
+            # Also project to cond_embedding space for conditioning
+            self.aa_cond_proj = nn.Linear(latent_size, hidden_size)
+            
+            # Scaling factor (like text_scale)
+            self.aa_scale = nn.Parameter(torch.tensor(1.0))
+            
+            self.aux_loss_weight = 1.0  # Same weight as text injection
+            
+            print(f"📌 LEARNED AA EMBED MODE: Direct AA → H_0 ({latent_size}), AA → cond ({hidden_size})")
 
         # topo embedding
         self.bond_embed = nn.Embedding(5, hidden_size) # [None, single, double, triple, aromatic]
@@ -130,6 +153,7 @@ class LDMMolDesign(nn.Module):
             text_v=None,    # Optional: [B, L_text, n_kv_heads, d_head] text value features
             mask_text=None, # Optional: [B, L_text] text attention mask
             text_lengths=None,  # Optional: [B] actual text lengths for RoPE
+            aa_indices=None,  # Optional: [B, L_aa] amino acid indices for learned AA embed mode
             t=None,         # Optional: fixed timestep for debugging/overfitting
         ):
         '''
@@ -290,6 +314,72 @@ class LDMMolDesign(nn.Module):
             self._aux_loss = aux_loss
             
             # Disable attention to text (we're using direct injection)
+            text_k, text_v, mask_text, text_lengths = None, None, None, None
+
+        # LEARNED AA EMBEDDING MODE: Simple direct AA → H_0 mapping
+        # This is the simplest possible shortcut test
+        if self.use_learned_aa_embed and aa_indices is not None:
+            batch_size = lengths.shape[0]
+            
+            # aa_indices: [B, L_aa] - indices into self.aa_embed
+            # Get embeddings: [B, L_aa, latent_size]
+            aa_h0_pred = self.aa_embed(aa_indices)  # Direct H_0 prediction!
+            
+            # Project to cond_embedding space for conditioning
+            aa_cond = self.aa_cond_proj(aa_h0_pred)  # [B, L_aa, hidden_size]
+            
+            # DEBUG
+            _debug_aa = True
+            if _debug_aa:
+                print(f"\n🔤 LEARNED AA EMBED DEBUG:")
+                print(f"  aa_indices shape: {aa_indices.shape}")
+                print(f"  aa_h0_pred stats: mean={aa_h0_pred.mean():.4f}, std={aa_h0_pred.std():.4f}")
+                print(f"  aa_cond stats: mean={aa_cond.mean():.4f}, std={aa_cond.std():.4f}")
+            
+            # Add to cond_embedding at CDR positions
+            aux_preds = []
+            aux_targets = []
+            offset = 0
+            for sample_idx in range(batch_size):
+                sample_len = int(lengths[sample_idx].item())
+                sample_mask = generate_mask[offset:offset + sample_len]
+                n_cdr = int(sample_mask.sum().item())
+                
+                # Get valid AA count for this sample
+                n_aa = (aa_indices[sample_idx] >= 0).sum().item()  # Assuming -1 or padding uses 0
+                n_to_add = min(n_cdr, n_aa)
+                
+                if n_to_add > 0:
+                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
+                    global_positions = offset + cdr_positions
+                    
+                    # Add AA cond to cond_embedding
+                    aa_cond_sample = aa_cond[sample_idx, :n_to_add]
+                    cond_embedding[global_positions] = cond_embedding[global_positions] + self.aa_scale * aa_cond_sample
+                    
+                    # Collect for auxiliary loss: direct AA → H_0 prediction
+                    h0_target = Zh[global_positions]  # [n_to_add, latent_size]
+                    h0_pred = aa_h0_pred[sample_idx, :n_to_add]  # [n_to_add, latent_size]
+                    aux_preds.append(h0_pred)
+                    aux_targets.append(h0_target)
+                
+                offset += sample_len
+            
+            # Compute auxiliary loss
+            if aux_preds:
+                aux_preds_cat = torch.cat(aux_preds, dim=0)
+                aux_targets_cat = torch.cat(aux_targets, dim=0)
+                aux_loss = F.mse_loss(aux_preds_cat, aux_targets_cat)
+                
+                if _debug_aa:
+                    print(f"  🎯 AA AUX LOSS: {aux_loss.item():.4f} (direct AA→H_0)")
+                    print(f"  aa_scale: {self.aa_scale.item():.4f}")
+            else:
+                aux_loss = torch.tensor(0.0, device=Zh.device)
+            
+            self._aux_loss = aux_loss
+            
+            # No attention conditioning
             text_k, text_v, mask_text, text_lengths = None, None, None, None
 
         loss_dict = self.diffusion.forward(
