@@ -61,8 +61,18 @@ class LDMMolDesign(nn.Module):
                 nn.Linear(hidden_size, hidden_size),  # Output to hidden_size for cond_embedding
             )
             # Learnable scaling factor for text conditioning strength
-            # Initialize to 0.1 to start conservatively (cond_embedding has std≈0.02)
-            self.text_scale = nn.Parameter(torch.tensor(0.1))
+            # Initialize to 1.0 to ensure text signal is prominent from the start
+            # (text_cond has std≈0.7, cond_embedding has std≈0.02)
+            # If model finds text unhelpful, it can learn to reduce this
+            self.text_scale = nn.Parameter(torch.tensor(1.0))
+            self._text_scale_init = 1.0  # Track initial value for reset
+    
+    def reset_text_scale(self, value: float = 1.0):
+        """Reset text_scale to a specific value (useful after loading checkpoint)."""
+        if hasattr(self, 'text_scale'):
+            with torch.no_grad():
+                self.text_scale.fill_(value)
+            print(f"📌 Reset text_scale to {value}")
             print(f"📌 TEXT INJECTION MODE: Projecting text ({text_embed_dim}) → cond_embedding ({hidden_size})")
 
         # topo embedding
