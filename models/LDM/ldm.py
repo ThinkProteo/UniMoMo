@@ -66,13 +66,6 @@ class LDMMolDesign(nn.Module):
             # If model finds text unhelpful, it can learn to reduce this
             self.text_scale = nn.Parameter(torch.tensor(1.0))
             self._text_scale_init = 1.0  # Track initial value for reset
-    
-    def reset_text_scale(self, value: float = 1.0):
-        """Reset text_scale to a specific value (useful after loading checkpoint)."""
-        if hasattr(self, 'text_scale'):
-            with torch.no_grad():
-                self.text_scale.fill_(value)
-            print(f"📌 Reset text_scale to {value}")
             print(f"📌 TEXT INJECTION MODE: Projecting text ({text_embed_dim}) → cond_embedding ({hidden_size})")
 
         # topo embedding
@@ -104,6 +97,13 @@ class LDMMolDesign(nn.Module):
             self.h_loss_weight = h_loss_weight
         self.register_buffer('std', torch.tensor(std, dtype=torch.float))
         self.is_aa_corrupt_ratio = is_aa_corrupt_ratio
+
+    def reset_text_scale(self, value: float = 1.0):
+        """Reset text_scale to a specific value (useful after loading checkpoint)."""
+        if hasattr(self, 'text_scale'):
+            with torch.no_grad():
+                self.text_scale.fill_(value)
+            print(f"📌 Reset text_scale to {value}")
 
     @oom_decorator
     def forward(
