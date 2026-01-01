@@ -428,7 +428,13 @@ def main(args):
     # individual level results
     print_and_log('Point-wise evaluation results:')
     for name in metrics[0]:
-        vals = [item[name] for item in metrics]
+        # Filter out items that don't have this key (some samples may have failed)
+        vals = [item[name] for item in metrics if name in item]
+        if len(vals) == 0:
+            print_and_log(f'{name}: No valid values (all samples missing this metric)')
+            continue
+        if len(vals) < len(metrics):
+            print_and_log(f'{name}: WARNING: Only {len(vals)}/{len(metrics)} samples have this metric')
         if isinstance(vals[0], dict):
             if (('RMSD' in name) or ('dG' in name) or ('ddG' in name)) and '<=' not in name:
                 aggr = 'min'
