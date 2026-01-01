@@ -37,11 +37,14 @@ class LDMMolDesign(nn.Module):
             text_injection_mode=False,  # NEW: Direct text injection instead of attention
             text_embed_dim=2560,  # Qwen3-4B hidden_size for per-residue embeddings
             use_learned_aa_embed=False,  # NEW: Use simple learned AA embeddings instead of Qwen
+            use_esm_embed=False,  # NEW: Use ESM-2 embeddings for structure-aware conditioning
+            esm_model_name="esm2_t33_650M_UR50D",  # ESM model variant
         ):
         super().__init__()
         self.latent_deterministic = latent_deterministic
         self.text_injection_mode = text_injection_mode
         self.use_learned_aa_embed = use_learned_aa_embed
+        self.use_esm_embed = use_esm_embed
 
         self.autoencoder: CondIterAutoEncoder = torch.load(
             autoencoder_ckpt, map_location='cpu', weights_only=False
@@ -105,6 +108,47 @@ class LDMMolDesign(nn.Module):
             
             print(f"📌 LEARNED AA EMBED MODE: Direct AA → H_0 ({latent_size}), AA → cond ({hidden_size})")
 
+        # ESM EMBEDDING MODE: Structure-aware protein language model embeddings
+        # ESM embeddings encode evolutionary/structural information, not just AA identity
+        if use_esm_embed:
+            try:
+                import esm
+                # Load ESM model (will be cached after first load)
+                self.esm_model, self.esm_alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+                self.esm_batch_converter = self.esm_alphabet.get_batch_converter()
+                self.esm_model.eval()
+                for param in self.esm_model.parameters():
+                    param.requires_grad = False
+                
+                esm_embed_dim = 1280  # ESM-2 650M hidden size
+                
+                # Project ESM embeddings to VAE latent space for direct H_0 prediction
+                self.esm_h0_proj = nn.Sequential(
+                    nn.Linear(esm_embed_dim, hidden_size),
+                    nn.SiLU(),
+                    nn.Linear(hidden_size, latent_size),
+                )
+                # Initialize output layer with small weights to match H_0 scale
+                nn.init.normal_(self.esm_h0_proj[-1].weight, mean=0.0, std=0.1)
+                nn.init.zeros_(self.esm_h0_proj[-1].bias)
+                
+                # Project to cond_embedding space for conditioning
+                self.esm_cond_proj = nn.Sequential(
+                    nn.Linear(esm_embed_dim, hidden_size),
+                    nn.SiLU(),
+                    nn.Linear(hidden_size, hidden_size),
+                )
+                
+                # Scaling factor
+                self.esm_scale = nn.Parameter(torch.tensor(1.0))
+                
+                self.aux_loss_weight = 1.0
+                
+                print(f"📌 ESM EMBED MODE: ESM-2 ({esm_embed_dim}) → H_0 ({latent_size}), → cond ({hidden_size})")
+            except ImportError:
+                print("⚠️ ESM not installed! Run: pip install fair-esm")
+                self.use_esm_embed = False
+
         # topo embedding
         self.bond_embed = nn.Embedding(5, hidden_size) # [None, single, double, triple, aromatic]
         self.atom_embed = nn.Embedding(VOCAB.get_num_atom_type(), hidden_size)
@@ -161,6 +205,7 @@ class LDMMolDesign(nn.Module):
             mask_text=None, # Optional: [B, L_text] text attention mask
             text_lengths=None,  # Optional: [B] actual text lengths for RoPE
             aa_indices=None,  # Optional: [B, L_aa] amino acid indices for learned AA embed mode
+            esm_embeddings=None,  # Optional: [B, L_aa, 1280] ESM per-residue embeddings
             t=None,         # Optional: fixed timestep for debugging/overfitting
         ):
         '''
@@ -400,6 +445,73 @@ class LDMMolDesign(nn.Module):
             # No attention conditioning
             text_k, text_v, mask_text, text_lengths = None, None, None, None
 
+        # ESM EMBEDDING MODE: Structure-aware protein language model embeddings
+        # ESM captures evolutionary/structural information beyond just AA identity
+        if self.use_esm_embed and esm_embeddings is not None:
+            batch_size = lengths.shape[0]
+            B, L_esm, esm_dim = esm_embeddings.shape
+            
+            # Project ESM embeddings to H_0 and cond spaces
+            # Cast to model dtype
+            proj_dtype = next(self.esm_h0_proj.parameters()).dtype
+            esm_embeddings = esm_embeddings.to(dtype=proj_dtype)
+            
+            esm_h0_pred = self.esm_h0_proj(esm_embeddings)  # [B, L_esm, latent_size]
+            esm_cond = self.esm_cond_proj(esm_embeddings)   # [B, L_esm, hidden_size]
+            
+            # DEBUG
+            _debug_esm = True
+            if _debug_esm:
+                print(f"\n🧬 ESM EMBED DEBUG:")
+                print(f"  esm_embeddings shape: {esm_embeddings.shape}")
+                print(f"  esm_h0_pred stats: mean={esm_h0_pred.mean():.4f}, std={esm_h0_pred.std():.4f}")
+                print(f"  esm_cond stats: mean={esm_cond.mean():.4f}, std={esm_cond.std():.4f}")
+                print(f"  H_0 (target) stats: mean={Zh.mean():.4f}, std={Zh.std():.4f}")
+            
+            # Add to cond_embedding at CDR positions
+            aux_preds = []
+            aux_targets = []
+            offset = 0
+            for sample_idx in range(batch_size):
+                sample_len = int(lengths[sample_idx].item())
+                sample_mask = generate_mask[offset:offset + sample_len]
+                n_cdr = int(sample_mask.sum().item())
+                
+                n_to_add = min(n_cdr, L_esm)
+                
+                if n_to_add > 0:
+                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
+                    global_positions = offset + cdr_positions
+                    
+                    # Add ESM cond to cond_embedding
+                    esm_cond_sample = esm_cond[sample_idx, :n_to_add]
+                    cond_embedding[global_positions] = cond_embedding[global_positions] + self.esm_scale * esm_cond_sample
+                    
+                    # Collect for auxiliary loss: direct ESM → H_0 prediction
+                    h0_target = Zh[global_positions]  # [n_to_add, latent_size]
+                    h0_pred = esm_h0_pred[sample_idx, :n_to_add]  # [n_to_add, latent_size]
+                    aux_preds.append(h0_pred)
+                    aux_targets.append(h0_target)
+                
+                offset += sample_len
+            
+            # Compute auxiliary loss
+            if aux_preds:
+                aux_preds_cat = torch.cat(aux_preds, dim=0)
+                aux_targets_cat = torch.cat(aux_targets, dim=0)
+                aux_loss = F.mse_loss(aux_preds_cat, aux_targets_cat)
+                
+                if _debug_esm:
+                    print(f"  🎯 ESM AUX LOSS: {aux_loss.item():.4f} (direct ESM→H_0)")
+                    print(f"  esm_scale: {self.esm_scale.item():.4f}")
+            else:
+                aux_loss = torch.tensor(0.0, device=Zh.device)
+            
+            self._aux_loss = aux_loss
+            
+            # No attention conditioning
+            text_k, text_v, mask_text, text_lengths = None, None, None, None
+
         loss_dict = self.diffusion.forward(
             H_0=Zh,
             X_0=Zx,
@@ -417,16 +529,20 @@ class LDMMolDesign(nn.Module):
         # loss - RESTORED: Original UniMoMo formula with h_loss_weight
         loss_dict['total'] = loss_dict['H'] * self.h_loss_weight + loss_dict['X']
 
-        # Add auxiliary loss for text injection mode (direct text→H_0 supervision)
-        if self.text_injection_mode and hasattr(self, '_aux_loss'):
+        # Add auxiliary loss for text/AA/ESM injection modes (direct → H_0 supervision)
+        if hasattr(self, '_aux_loss'):
             aux_loss = self._aux_loss
             loss_dict['aux_loss'] = aux_loss
             loss_dict['total'] = loss_dict['total'] + self.aux_loss_weight * aux_loss
             del self._aux_loss  # Clean up
 
-        # Log text_scale if using text injection mode
+        # Log scale parameters
         if self.text_injection_mode and hasattr(self, 'text_scale'):
             loss_dict['text_scale'] = self.text_scale.detach()
+        if self.use_learned_aa_embed and hasattr(self, 'aa_scale'):
+            loss_dict['aa_scale'] = self.aa_scale.detach()
+        if self.use_esm_embed and hasattr(self, 'esm_scale'):
+            loss_dict['esm_scale'] = self.esm_scale.detach()
 
         return loss_dict
 
@@ -497,6 +613,7 @@ class LDMMolDesign(nn.Module):
             mask_text=None, # Optional: [B, L_text] text attention mask
             text_lengths=None,  # Optional: [B] actual text lengths for RoPE
             aa_indices=None,  # Optional: [B, L_aa] amino acid indices for learned AA embed mode
+            esm_embeddings=None,  # Optional: [B, L_aa, 1280] ESM per-residue embeddings
             sample_opt={
                 'pbar': False,
                 # 'energy_func': None,
@@ -625,6 +742,34 @@ class LDMMolDesign(nn.Module):
                 offset += sample_len
             
             # In text injection mode, we don't use attention
+            text_k, text_v, mask_text, text_lengths = None, None, None, None
+        
+        # ESM EMBEDDING MODE: Add ESM embeddings to cond_embedding during sampling
+        if self.use_esm_embed and esm_embeddings is not None:
+            batch_size = lengths.shape[0]
+            B, L_esm, esm_dim = esm_embeddings.shape
+            
+            # Project ESM embeddings to cond space
+            proj_dtype = next(self.esm_cond_proj.parameters()).dtype
+            esm_embeddings = esm_embeddings.to(dtype=proj_dtype)
+            esm_cond = self.esm_cond_proj(esm_embeddings)  # [B, L_esm, hidden_size]
+            
+            offset = 0
+            for sample_idx in range(batch_size):
+                sample_len = int(lengths[sample_idx].item())
+                sample_mask = generate_mask[offset:offset + sample_len]
+                n_cdr = int(sample_mask.sum().item())
+                n_to_add = min(n_cdr, L_esm)
+                
+                if n_to_add > 0:
+                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
+                    global_positions = offset + cdr_positions
+                    esm_embed = esm_cond[sample_idx, :n_to_add]
+                    cond_embedding[global_positions] = cond_embedding[global_positions] + self.esm_scale * esm_embed
+                
+                offset += sample_len
+            
+            # In ESM mode, we don't use attention
             text_k, text_v, mask_text, text_lengths = None, None, None, None
         
         traj = self.diffusion.sample(
