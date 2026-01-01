@@ -86,10 +86,14 @@ class LDMMolDesign(nn.Module):
             
             # Direct embedding to VAE latent space (not hidden_size!)
             # This is the simplest possible shortcut: AA → H_0
+            # IMPORTANT: Initialize with std=0.35 to match H_0 scale (not default N(0,1))
             self.aa_embed = nn.Embedding(21, latent_size)
+            nn.init.normal_(self.aa_embed.weight, mean=0.0, std=0.35)
             
             # Position embedding for CDR positions (max 50 positions should be enough)
+            # Also initialize with small std to not overwhelm AA identity signal
             self.aa_pos_embed = nn.Embedding(50, latent_size)
+            nn.init.normal_(self.aa_pos_embed.weight, mean=0.0, std=0.1)
             
             # Also project to cond_embedding space for conditioning
             self.aa_cond_proj = nn.Linear(latent_size, hidden_size)
