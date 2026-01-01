@@ -109,7 +109,7 @@ class LDMMolDesign(nn.Module):
             print(f"📌 LEARNED AA EMBED MODE: Direct AA → H_0 ({latent_size}), AA → cond ({hidden_size})")
 
         # ESM EMBEDDING MODE: Structure-aware protein language model embeddings
-        # ESM embeddings encode evolutionary/structural information, not just AA identity
+        # ESM embeddings encode evolutionary/structural information beyond just AA identity
         if use_esm_embed:
             try:
                 import esm
@@ -122,29 +122,33 @@ class LDMMolDesign(nn.Module):
                 
                 esm_embed_dim = 1280  # ESM-2 650M hidden size
                 
-                # Project ESM embeddings to VAE latent space for direct H_0 prediction
+                # Project ESM to H_0 space for DIRECT sequence prediction (with aux_loss)
+                # This is the key connection to the diffusion model head!
                 self.esm_h0_proj = nn.Sequential(
                     nn.Linear(esm_embed_dim, hidden_size),
                     nn.SiLU(),
                     nn.Linear(hidden_size, latent_size),
                 )
-                # Initialize output layer with small weights to match H_0 scale
+                # Initialize output layer with small weights to match H_0 scale (~0.35 std)
                 nn.init.normal_(self.esm_h0_proj[-1].weight, mean=0.0, std=0.1)
                 nn.init.zeros_(self.esm_h0_proj[-1].bias)
                 
-                # Project to cond_embedding space for conditioning
+                # Project ESM to cond_embedding space for structural conditioning
                 self.esm_cond_proj = nn.Sequential(
                     nn.Linear(esm_embed_dim, hidden_size),
                     nn.SiLU(),
                     nn.Linear(hidden_size, hidden_size),
                 )
                 
-                # Scaling factor
+                # Scaling factor for ESM contribution to cond_embedding
                 self.esm_scale = nn.Parameter(torch.tensor(1.0))
                 
+                # Auxiliary loss weight (direct ESM → H_0 prediction)
                 self.aux_loss_weight = 1.0
                 
-                print(f"📌 ESM EMBED MODE: ESM-2 ({esm_embed_dim}) → H_0 ({latent_size}), → cond ({hidden_size})")
+                print(f"📌 ESM EMBED MODE:")
+                print(f"   - ESM-2 ({esm_embed_dim}) → H_0 ({latent_size}) with aux_loss (sequence)")
+                print(f"   - ESM-2 ({esm_embed_dim}) → cond ({hidden_size}) (structure context)")
             except ImportError:
                 print("⚠️ ESM not installed! Run: pip install fair-esm")
                 self.use_esm_embed = False
@@ -445,17 +449,16 @@ class LDMMolDesign(nn.Module):
             # No attention conditioning
             text_k, text_v, mask_text, text_lengths = None, None, None, None
 
-        # ESM EMBEDDING MODE: Structure-aware protein language model embeddings
-        # ESM captures evolutionary/structural information beyond just AA identity
+        # ESM EMBEDDING MODE: Use ESM for both sequence and structure
+        # esm_h0_proj trains to predict H_0 from ESM (with aux_loss)
+        # esm_cond_proj provides conditioning signal via cond_embedding
         if self.use_esm_embed and esm_embeddings is not None:
             batch_size = lengths.shape[0]
             B, L_esm, esm_dim = esm_embeddings.shape
             
-            # Project ESM embeddings to H_0 and cond spaces
-            # Cast to model dtype
-            proj_dtype = next(self.esm_h0_proj.parameters()).dtype
+            # Project ESM embeddings to both H_0 and cond spaces
+            proj_dtype = next(self.esm_cond_proj.parameters()).dtype
             esm_embeddings = esm_embeddings.to(dtype=proj_dtype)
-            
             esm_h0_pred = self.esm_h0_proj(esm_embeddings)  # [B, L_esm, latent_size]
             esm_cond = self.esm_cond_proj(esm_embeddings)   # [B, L_esm, hidden_size]
             
@@ -463,12 +466,13 @@ class LDMMolDesign(nn.Module):
             _debug_esm = True
             if _debug_esm:
                 print(f"\n🧬 ESM EMBED DEBUG:")
+                print(f"  ESM device: {esm_embeddings.device}, dtype: {esm_embeddings.dtype}")
                 print(f"  esm_embeddings shape: {esm_embeddings.shape}")
                 print(f"  esm_h0_pred stats: mean={esm_h0_pred.mean():.4f}, std={esm_h0_pred.std():.4f}")
                 print(f"  esm_cond stats: mean={esm_cond.mean():.4f}, std={esm_cond.std():.4f}")
                 print(f"  H_0 (target) stats: mean={Zh.mean():.4f}, std={Zh.std():.4f}")
             
-            # Add to cond_embedding at CDR positions
+            # Process each sample
             aux_preds = []
             aux_targets = []
             offset = 0
@@ -476,34 +480,36 @@ class LDMMolDesign(nn.Module):
                 sample_len = int(lengths[sample_idx].item())
                 sample_mask = generate_mask[offset:offset + sample_len]
                 n_cdr = int(sample_mask.sum().item())
-                
                 n_to_add = min(n_cdr, L_esm)
                 
                 if n_to_add > 0:
                     cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
                     global_positions = offset + cdr_positions
                     
-                    # Add ESM cond to cond_embedding
+                    # Add ESM to cond_embedding (this is the diffusion input conditioning)
                     esm_cond_sample = esm_cond[sample_idx, :n_to_add]
                     cond_embedding[global_positions] = cond_embedding[global_positions] + self.esm_scale * esm_cond_sample
                     
-                    # Collect for auxiliary loss: direct ESM → H_0 prediction
-                    h0_target = Zh[global_positions]  # [n_to_add, latent_size]
+                    # Collect for auxiliary loss: supervise esm_h0_proj to predict H_0
                     h0_pred = esm_h0_pred[sample_idx, :n_to_add]  # [n_to_add, latent_size]
+                    h0_target = Zh[global_positions]  # [n_to_add, latent_size]
                     aux_preds.append(h0_pred)
                     aux_targets.append(h0_target)
                 
                 offset += sample_len
             
-            # Compute auxiliary loss
+            # Compute auxiliary loss: direct ESM → H_0 supervision
             if aux_preds:
                 aux_preds_cat = torch.cat(aux_preds, dim=0)
                 aux_targets_cat = torch.cat(aux_targets, dim=0)
                 aux_loss = F.mse_loss(aux_preds_cat, aux_targets_cat)
                 
                 if _debug_esm:
-                    print(f"  🎯 ESM AUX LOSS: {aux_loss.item():.4f} (direct ESM→H_0)")
+                    print(f"  🎯 ESM AUX LOSS: {aux_loss.item():.4f}")
                     print(f"  esm_scale: {self.esm_scale.item():.4f}")
+                    # Per-AA analysis: check if certain AAs are harder
+                    residual = (aux_preds_cat - aux_targets_cat).abs()
+                    print(f"  Residual: mean={residual.mean():.4f}, max={residual.max():.4f}")
             else:
                 aux_loss = torch.tensor(0.0, device=Zh.device)
             
@@ -744,15 +750,22 @@ class LDMMolDesign(nn.Module):
             # In text injection mode, we don't use attention
             text_k, text_v, mask_text, text_lengths = None, None, None, None
         
-        # ESM EMBEDDING MODE: Add ESM embeddings to cond_embedding during sampling
+        # ESM EMBEDDING MODE: Use ESM for sampling
+        # KEY: Use esm_h0_proj prediction as H_prior for diffusion initialization
+        # This connects the trained esm_h0_proj directly to the diffusion output!
+        H_prior = None
         if self.use_esm_embed and esm_embeddings is not None:
             batch_size = lengths.shape[0]
             B, L_esm, esm_dim = esm_embeddings.shape
             
-            # Project ESM embeddings to cond space
+            # Project ESM embeddings to both H_0 and cond spaces
             proj_dtype = next(self.esm_cond_proj.parameters()).dtype
             esm_embeddings = esm_embeddings.to(dtype=proj_dtype)
-            esm_cond = self.esm_cond_proj(esm_embeddings)  # [B, L_esm, hidden_size]
+            esm_h0_pred = self.esm_h0_proj(esm_embeddings)  # [B, L_esm, latent_size] - trained to predict H_0!
+            esm_cond = self.esm_cond_proj(esm_embeddings)   # [B, L_esm, hidden_size]
+            
+            # Initialize H_prior with zeros, then fill with ESM predictions at CDR positions
+            H_prior = torch.zeros_like(Zh)
             
             offset = 0
             for sample_idx in range(batch_size):
@@ -764,8 +777,14 @@ class LDMMolDesign(nn.Module):
                 if n_to_add > 0:
                     cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
                     global_positions = offset + cdr_positions
+                    
+                    # Add ESM to cond_embedding
                     esm_embed = esm_cond[sample_idx, :n_to_add]
                     cond_embedding[global_positions] = cond_embedding[global_positions] + self.esm_scale * esm_embed
+                    
+                    # Set H_prior at CDR positions with esm_h0_pred
+                    h0_pred = esm_h0_pred[sample_idx, :n_to_add]
+                    H_prior[global_positions] = h0_pred
                 
                 offset += sample_len
             
@@ -783,6 +802,7 @@ class LDMMolDesign(nn.Module):
             text_v=text_v,
             mask_text=mask_text,
             text_lengths=text_lengths,
+            H_prior=H_prior,  # Use ESM prediction as initialization prior
             **sample_opt
         )
         X_0, H_0 = traj[0]
