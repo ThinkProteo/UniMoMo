@@ -496,6 +496,7 @@ class LDMMolDesign(nn.Module):
             text_v=None,    # Optional: [B, L_text, n_kv_heads, d_head] text value features
             mask_text=None, # Optional: [B, L_text] text attention mask
             text_lengths=None,  # Optional: [B] actual text lengths for RoPE
+            aa_indices=None,  # Optional: [B, L_aa] amino acid indices for learned AA embed mode
             sample_opt={
                 'pbar': False,
                 # 'energy_func': None,
@@ -506,6 +507,7 @@ class LDMMolDesign(nn.Module):
         '''
             Sample from the diffusion model with optional text conditioning.
             When text_k, text_v, mask_text, text_lengths are provided, the generation is conditioned on text embeddings.
+            When aa_indices is provided and use_learned_aa_embed=True, uses learned AA embeddings for conditioning.
         '''
 
         vae_decode_n_iter = sample_opt.pop('vae_decode_n_iter', 10)
@@ -549,8 +551,44 @@ class LDMMolDesign(nn.Module):
         # condition embedding
         cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
         
+        # LEARNED AA EMBEDDING MODE: Use simple learned AA embeddings for conditioning
+        if self.use_learned_aa_embed and aa_indices is not None:
+            batch_size = lengths.shape[0]
+            
+            # Get position indices for position embedding
+            max_len = aa_indices.shape[1]
+            pos_indices = torch.arange(max_len, device=aa_indices.device).unsqueeze(0).expand_as(aa_indices)
+            
+            # Get AA embeddings with position
+            aa_embed_raw = self.aa_embed(aa_indices)       # [B, L_aa, latent_size]
+            pos_embed = self.aa_pos_embed(pos_indices)     # [B, L_aa, latent_size]
+            aa_h0_pred = aa_embed_raw + pos_embed          # Combined
+            
+            # Project to cond_embedding space
+            aa_cond = self.aa_cond_proj(aa_h0_pred)        # [B, L_aa, hidden_size]
+            
+            # Add to cond_embedding at generate_mask positions
+            offset = 0
+            for sample_idx in range(batch_size):
+                sample_len = int(lengths[sample_idx].item())
+                sample_mask = generate_mask[offset:offset + sample_len]
+                n_cdr = int(sample_mask.sum().item())
+                n_aa = aa_indices.shape[1]
+                n_to_add = min(n_cdr, n_aa)
+                
+                if n_to_add > 0:
+                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
+                    aa_embed = aa_cond[sample_idx, :n_to_add]  # [n_to_add, hidden_size]
+                    global_positions = offset + cdr_positions
+                    cond_embedding[global_positions] = cond_embedding[global_positions] + self.aa_scale * aa_embed
+                
+                offset += sample_len
+            
+            # In learned AA embed mode, disable attention-based text conditioning
+            text_k, text_v, mask_text, text_lengths = None, None, None, None
+        
         # TEXT INJECTION MODE: Add text embedding to cond_embedding during sampling
-        if self.text_injection_mode and text_v is not None and mask_text is not None:
+        elif self.text_injection_mode and text_v is not None and mask_text is not None:
             if text_v.dim() == 4:
                 B, L_text, n_heads, head_dim = text_v.shape
                 text_v_flat = text_v.view(B, L_text, n_heads * head_dim)
