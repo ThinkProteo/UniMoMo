@@ -249,7 +249,7 @@ class EPTAttentionMoT(nn.Module):
     """
     
     # Class-level debug settings
-    _debug_text_attn = True  # Set to True to print text attention stats
+    _debug_text_attn = False  # Set to True to print text attention stats
     _debug_step_counter = 0
     _debug_print_interval = 50  # Print every N forward passes
 

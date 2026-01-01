@@ -176,7 +176,7 @@ class LDMMolDesign(nn.Module):
             # cond_embedding: [Nblock, hidden_size] where Nblock = sum(lengths)
             
             # DEBUG: Print text injection stats
-            _debug_injection = False  # Set to True for debugging
+            _debug_injection = True  # Set to True for debugging
             if _debug_injection:
                 print(f"\n🔍 TEXT INJECTION DEBUG - LDM (cond_embedding mode):")
                 print(f"  text_v shape: {text_v.shape}, text_cond shape: {text_cond.shape}")

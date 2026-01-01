@@ -248,7 +248,7 @@ class FullDPM(nn.Module):
             loss_dict['H'] = loss_H_weighted
 
             # DEBUG: Print H loss details
-            _debug_h_loss = False  # Set to True for debugging
+            _debug_h_loss = True  # Set to True for debugging
             if _debug_h_loss:
                 with torch.no_grad():
                     n_gen = generate_mask.sum().item()
