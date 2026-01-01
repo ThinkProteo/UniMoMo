@@ -88,6 +88,9 @@ class LDMMolDesign(nn.Module):
             # This is the simplest possible shortcut: AA → H_0
             self.aa_embed = nn.Embedding(21, latent_size)
             
+            # Position embedding for CDR positions (max 50 positions should be enough)
+            self.aa_pos_embed = nn.Embedding(50, latent_size)
+            
             # Also project to cond_embedding space for conditioning
             self.aa_cond_proj = nn.Linear(latent_size, hidden_size)
             
@@ -320,10 +323,19 @@ class LDMMolDesign(nn.Module):
         # This is the simplest possible shortcut test
         if self.use_learned_aa_embed and aa_indices is not None:
             batch_size = lengths.shape[0]
+            B, L_aa = aa_indices.shape
             
             # aa_indices: [B, L_aa] - indices into self.aa_embed
-            # Get embeddings: [B, L_aa, latent_size]
-            aa_h0_pred = self.aa_embed(aa_indices)  # Direct H_0 prediction!
+            # Get AA embeddings: [B, L_aa, latent_size]
+            aa_embed_raw = self.aa_embed(aa_indices)
+            
+            # Add position embeddings (0, 1, 2, ... for each position in CDR)
+            pos_indices = torch.arange(L_aa, device=aa_indices.device).unsqueeze(0).expand(B, -1)
+            pos_indices = pos_indices.clamp(max=49)  # Clamp to max position
+            pos_embed = self.aa_pos_embed(pos_indices)  # [B, L_aa, latent_size]
+            
+            # Combine: AA identity + position
+            aa_h0_pred = aa_embed_raw + pos_embed  # [B, L_aa, latent_size]
             
             # Project to cond_embedding space for conditioning
             aa_cond = self.aa_cond_proj(aa_h0_pred)  # [B, L_aa, hidden_size]
@@ -331,9 +343,11 @@ class LDMMolDesign(nn.Module):
             # DEBUG
             _debug_aa = True
             if _debug_aa:
-                print(f"\n🔤 LEARNED AA EMBED DEBUG:")
+                print(f"\n🔤 LEARNED AA EMBED DEBUG (with position):")
                 print(f"  aa_indices shape: {aa_indices.shape}")
-                print(f"  aa_h0_pred stats: mean={aa_h0_pred.mean():.4f}, std={aa_h0_pred.std():.4f}")
+                print(f"  aa_embed_raw stats: mean={aa_embed_raw.mean():.4f}, std={aa_embed_raw.std():.4f}")
+                print(f"  pos_embed stats: mean={pos_embed.mean():.4f}, std={pos_embed.std():.4f}")
+                print(f"  aa_h0_pred (aa+pos) stats: mean={aa_h0_pred.mean():.4f}, std={aa_h0_pred.std():.4f}")
                 print(f"  aa_cond stats: mean={aa_cond.mean():.4f}, std={aa_cond.std():.4f}")
             
             # Add to cond_embedding at CDR positions
