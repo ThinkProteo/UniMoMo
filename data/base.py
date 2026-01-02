@@ -291,6 +291,11 @@ class BaseDataset(MMAPDataset):
             if self.use_gt_seq:
                 # DEBUG: Use ground truth CDR sequence for QKV conditioning
                 # Store raw GT sequence - text_injection_mode will tokenize per-residue
+                # Validate that ref_seq is an actual amino acid sequence
+                valid_aas = set("ACDEFGHIKLMNPQRSTVWY")
+                if not summary.ref_seq or not all(aa.upper() in valid_aas for aa in summary.ref_seq):
+                    raise ValueError(f"Invalid ref_seq for {summary.id}: '{summary.ref_seq}' "
+                                   f"is not a valid amino acid sequence")
                 data['response_qkv_text'] = summary.ref_seq
                 data['gt_seq_for_injection'] = summary.ref_seq  # Raw sequence for per-residue tokenization
                 if data.get('raw_text'):
