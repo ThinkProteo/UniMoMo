@@ -1,5 +1,20 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
+"""
+LDM (Latent Diffusion Model) for Protein Structure Generation.
+
+This module implements the LDMMolDesign class which combines:
+- VAE encoder for structure latent representation
+- Diffusion model for structure generation
+- Sequence conditioners for text/AA/ESM-based conditioning
+
+Conditioning modes (mutually exclusive):
+1. text_injection_mode: Qwen per-residue embeddings
+2. use_learned_aa_embed: Learned AA embeddings with position
+3. use_esm_embed: ESM-2 protein language model embeddings
+4. Default: Qwen QKV attention conditioning
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,9 +35,18 @@ from .diffusion.dpm_full import FullDPM
 from ..IterVAE.model import CondIterAutoEncoder
 from ..modules.nn import GINEConv, MLP
 
+# Import conditioners
+from .conditioners import QwenTextConditioner, LearnedAAConditioner, ESMConditioner
+
 
 @R.register('LDMMolDesign')
 class LDMMolDesign(nn.Module):
+    """
+    Latent Diffusion Model for Molecular Design.
+    
+    Combines VAE encoding with diffusion-based structure generation,
+    optionally conditioned on sequence information via pluggable conditioners.
+    """
 
     def __init__(
             self,
@@ -34,11 +58,14 @@ class LDMMolDesign(nn.Module):
             std=10.0,
             is_aa_corrupt_ratio=0.1,
             diffusion_opt={},
-            text_injection_mode=False,  # NEW: Direct text injection instead of attention
-            text_embed_dim=2560,  # Qwen3-4B hidden_size for per-residue embeddings
-            use_learned_aa_embed=False,  # NEW: Use simple learned AA embeddings instead of Qwen
-            use_esm_embed=False,  # NEW: Use ESM-2 embeddings for structure-aware conditioning
-            esm_model_name="esm2_t33_650M_UR50D",  # ESM model variant
+            # Conditioning options (mutually exclusive)
+            text_injection_mode=False,
+            text_embed_dim=2560,
+            use_learned_aa_embed=False,
+            use_esm_embed=False,
+            esm_model_name="esm2_t33_650M_UR50D",
+            # Debug options
+            debug_conditioning=True,
         ):
         super().__init__()
         self.latent_deterministic = latent_deterministic
@@ -46,6 +73,7 @@ class LDMMolDesign(nn.Module):
         self.use_learned_aa_embed = use_learned_aa_embed
         self.use_esm_embed = use_esm_embed
 
+        # Load frozen VAE
         self.autoencoder: CondIterAutoEncoder = torch.load(
             autoencoder_ckpt, map_location='cpu', weights_only=False
         )
@@ -54,475 +82,188 @@ class LDMMolDesign(nn.Module):
         self.autoencoder.eval()
 
         latent_size = self.autoencoder.latent_size
-        self.hidden_size = hidden_size  # Save for text projection
+        self.hidden_size = hidden_size
+        self.latent_size = latent_size
         
-        # Text injection: project per-residue text embedding to cond_embedding space
-        # text_v shape: [B, L_text, hidden_dim] = [B, L, 2560] (Qwen hidden states)
-        # Each token = one amino acid (1:1 mapping)
-        # Project: [B, L, 2560] -> [B, L, hidden_size] (to match cond_embedding)
-        if text_injection_mode:
-            self.text_proj = nn.Sequential(
-                nn.Linear(text_embed_dim, hidden_size),
-                nn.SiLU(),
-                nn.Linear(hidden_size, hidden_size),  # Output to hidden_size for cond_embedding
-            )
-            # Learnable scaling factor for text conditioning strength
-            # Initialize to 1.0 to ensure text signal is prominent from the start
-            # (text_cond has std≈0.7, cond_embedding has std≈0.02)
-            # If model finds text unhelpful, it can learn to reduce this
-            self.text_scale = nn.Parameter(torch.tensor(1.0))
-            self._text_scale_init = 1.0  # Track initial value for reset
-            
-            # Auxiliary projection: text → H_0 (VAE latent) for direct supervision
-            # This gives text_proj a direct learning signal
-            self.text_h0_proj = nn.Linear(hidden_size, latent_size)
-            self.aux_loss_weight = 1.0  # Weight for auxiliary loss (increased from 0.1)
-            
-            print(f"📌 TEXT INJECTION MODE: Projecting text ({text_embed_dim}) → cond ({hidden_size}) + H_0 ({latent_size})")
-        
-        # SIMPLE LEARNED AA EMBEDDINGS - Alternative to Qwen
-        # This gives the model a direct, fully learnable mapping: AA → H_0
-        if use_learned_aa_embed:
-            # Standard amino acid vocabulary: A C D E F G H I K L M N P Q R S T V W Y + X (unknown)
-            self.aa_vocab = "ACDEFGHIKLMNPQRSTVWYX"  # 21 amino acids
-            self.aa_to_idx = {aa: i for i, aa in enumerate(self.aa_vocab)}
-            
-            # Direct embedding to VAE latent space (not hidden_size!)
-            # This is the simplest possible shortcut: AA → H_0
-            # IMPORTANT: Initialize with std=0.35 to match H_0 scale (not default N(0,1))
-            self.aa_embed = nn.Embedding(21, latent_size)
-            nn.init.normal_(self.aa_embed.weight, mean=0.0, std=0.35)
-            
-            # Position embedding for CDR positions (max 50 positions should be enough)
-            # Also initialize with small std to not overwhelm AA identity signal
-            self.aa_pos_embed = nn.Embedding(50, latent_size)
-            nn.init.normal_(self.aa_pos_embed.weight, mean=0.0, std=0.1)
-            
-            # Also project to cond_embedding space for conditioning
-            self.aa_cond_proj = nn.Linear(latent_size, hidden_size)
-            
-            # Scaling factor (like text_scale)
-            self.aa_scale = nn.Parameter(torch.tensor(1.0))
-            
-            self.aux_loss_weight = 1.0  # Same weight as text injection
-            
-            print(f"📌 LEARNED AA EMBED MODE: Direct AA → H_0 ({latent_size}), AA → cond ({hidden_size})")
+        # ========== CONDITIONER SETUP ==========
+        # Create appropriate conditioner based on config
+        self.conditioner = None
+        self._setup_conditioner(
+            text_injection_mode=text_injection_mode,
+            text_embed_dim=text_embed_dim,
+            use_learned_aa_embed=use_learned_aa_embed,
+            use_esm_embed=use_esm_embed,
+            esm_model_name=esm_model_name,
+            hidden_size=hidden_size,
+            latent_size=latent_size,
+            debug=debug_conditioning,
+        )
 
-        # ESM EMBEDDING MODE: Structure-aware protein language model embeddings
-        # ESM embeddings encode evolutionary/structural information beyond just AA identity
-        if use_esm_embed:
-            try:
-                import esm
-                # Load ESM model (will be cached after first load)
-                self.esm_model, self.esm_alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-                self.esm_batch_converter = self.esm_alphabet.get_batch_converter()
-                self.esm_model.eval()
-                for param in self.esm_model.parameters():
-                    param.requires_grad = False
-                
-                esm_embed_dim = 1280  # ESM-2 650M hidden size
-                
-                # ARCHITECTURE: ESM → esm_cond_proj → esm_cond → esm_h0_proj → H_0
-                # This creates a CHAINED projection where gradients flow through both
-                
-                # Step 1: Project ESM to cond_embedding space (shared representation)
-                self.esm_cond_proj = nn.Sequential(
-                    nn.Linear(esm_embed_dim, hidden_size),
-                    nn.SiLU(),
-                    nn.Linear(hidden_size, hidden_size),
-                )
-                
-                # Step 2: Project cond to H_0 space (for aux_loss and H_prior)
-                # Takes esm_cond (hidden_size) as input, NOT raw ESM embeddings!
-                self.esm_h0_proj = nn.Sequential(
-                    nn.Linear(hidden_size, hidden_size // 2),
-                    nn.SiLU(),
-                    nn.Linear(hidden_size // 2, latent_size),
-                )
-                # Initialize output layer with small weights to match H_0 scale (~0.35 std)
-                nn.init.normal_(self.esm_h0_proj[-1].weight, mean=0.0, std=0.1)
-                nn.init.zeros_(self.esm_h0_proj[-1].bias)
-                
-                # Scaling factor for ESM contribution to cond_embedding
-                self.esm_scale = nn.Parameter(torch.tensor(1.0))
-                
-                # Auxiliary loss weight (direct ESM → H_0 prediction)
-                self.aux_loss_weight = 1.0
-                
-                print(f"📌 ESM EMBED MODE (chained projection):")
-                print(f"   - ESM-2 ({esm_embed_dim}) → esm_cond_proj → cond ({hidden_size})")
-                print(f"   - cond ({hidden_size}) → esm_h0_proj → H_0 ({latent_size})")
-                print(f"   - Gradients flow: aux_loss → esm_h0_proj → esm_cond_proj")
-            except ImportError:
-                print("⚠️ ESM not installed! Run: pip install fair-esm")
-                self.use_esm_embed = False
-
-        # topo embedding
-        self.bond_embed = nn.Embedding(5, hidden_size) # [None, single, double, triple, aromatic]
+        # ========== TOPOLOGY EMBEDDINGS ==========
+        self.bond_embed = nn.Embedding(5, hidden_size)  # [None, single, double, triple, aromatic]
         self.atom_embed = nn.Embedding(VOCAB.get_num_atom_type(), hidden_size)
         self.topo_gnn = GINEConv(hidden_size, hidden_size, hidden_size, hidden_size)
 
         self.position_encoding = SinusoidalPositionEmbedding(hidden_size)
-        self.is_aa_embed = nn.Embedding(2, hidden_size) # is or is not standard amino acid
+        self.is_aa_embed = nn.Embedding(2, hidden_size)  # is or is not standard amino acid
 
-        # condition embedding MLP
+        # Condition embedding MLP
         self.cond_mlp = MLP(
-            input_size=3 * hidden_size, # [position, topo, is_aa]
+            input_size=3 * hidden_size,  # [position, topo, is_aa]
             hidden_size=hidden_size,
             output_size=hidden_size,
             n_layers=3,
             dropout=0.1
         )
 
+        # ========== DIFFUSION MODEL ==========
         self.diffusion = FullDPM(
             latent_size=latent_size,
             hidden_size=hidden_size,
             num_steps=num_steps,
             **diffusion_opt
         )
+        
         if h_loss_weight is None:
-            self.h_loss_weight = 3 / latent_size  # make loss_X and loss_H about the same size
+            self.h_loss_weight = 3 / latent_size
         else:
             self.h_loss_weight = h_loss_weight
         self.register_buffer('std', torch.tensor(std, dtype=torch.float))
         self.is_aa_corrupt_ratio = is_aa_corrupt_ratio
 
-    def reset_text_scale(self, value: float = 1.0):
-        """Reset text_scale to a specific value (useful after loading checkpoint)."""
-        if hasattr(self, 'text_scale'):
-            with torch.no_grad():
-                self.text_scale.fill_(value)
-            print(f"📌 Reset text_scale to {value}")
+    def _setup_conditioner(
+        self,
+        text_injection_mode: bool,
+        text_embed_dim: int,
+        use_learned_aa_embed: bool,
+        use_esm_embed: bool,
+        esm_model_name: str,
+        hidden_size: int,
+        latent_size: int,
+        debug: bool,
+    ):
+        """Setup the appropriate conditioner based on config."""
+        if use_esm_embed:
+            self.conditioner = ESMConditioner(
+                hidden_size=hidden_size,
+                latent_size=latent_size,
+                esm_model_name=esm_model_name,
+                debug=debug,
+            )
+            # Store reference for ESM extraction convenience
+            self._esm_conditioner = self.conditioner
+        elif use_learned_aa_embed:
+            self.conditioner = LearnedAAConditioner(
+                hidden_size=hidden_size,
+                latent_size=latent_size,
+                debug=debug,
+            )
+        elif text_injection_mode:
+            self.conditioner = QwenTextConditioner(
+                hidden_size=hidden_size,
+                latent_size=latent_size,
+                text_embed_dim=text_embed_dim,
+                debug=debug,
+            )
+        else:
+            # No conditioner - use default attention-based conditioning
+            self.conditioner = None
+            print("📌 No sequence conditioner - using default attention-based conditioning")
 
+    @property
+    def aux_loss_weight(self) -> float:
+        """Get auxiliary loss weight from conditioner."""
+        if self.conditioner is not None:
+            return self.conditioner.aux_loss_weight
+        return 0.0
+
+    def reset_text_scale(self, value: float = 1.0):
+        """Reset conditioner scale to a specific value."""
+        if self.conditioner is not None and hasattr(self.conditioner, 'scale'):
+            with torch.no_grad():
+                self.conditioner.scale.fill_(value)
+            print(f"📌 Reset conditioner scale to {value}")
+
+    # ========== FORWARD PASS ==========
     @oom_decorator
     def forward(
             self,
             X,              # [Natom, 3], atom coordinates
             S,              # [Nblock], block types
             A,              # [Natom], atom types
-            bonds,          # [Nbonds, 3], chemical bonds, src-dst-type (single: 1, double: 2, triple: 3)
+            bonds,          # [Nbonds, 3], chemical bonds
             position_ids,   # [Nblock], block position ids
             chain_ids,      # [Nblock], split different chains
             generate_mask,  # [Nblock], 1 for generation, 0 for context
             center_mask,    # [Nblock], 1 for used to calculate complex center of mass
             block_lengths,  # [Nblock], number of atoms in each block
             lengths,        # [batch_size]
-            is_aa,          # [Nblock], 1 for amino acid (for determining the X_mask in inverse folding)
-            text_k=None,    # Optional: [B, L_text, n_kv_heads, d_head] text key features
-            text_v=None,    # Optional: [B, L_text, n_kv_heads, d_head] text value features
-            mask_text=None, # Optional: [B, L_text] text attention mask
-            text_lengths=None,  # Optional: [B] actual text lengths for RoPE
-            aa_indices=None,  # Optional: [B, L_aa] amino acid indices for learned AA embed mode
-            esm_embeddings=None,  # Optional: [B, L_aa, 1280] ESM per-residue embeddings
-            t=None,         # Optional: fixed timestep for debugging/overfitting
+            is_aa,          # [Nblock], 1 for amino acid
+            # Conditioning inputs (optional, depends on mode)
+            text_k=None,
+            text_v=None,
+            mask_text=None,
+            text_lengths=None,
+            aa_indices=None,
+            esm_embeddings=None,
+            t=None,
         ):
-        '''
-            Optional text conditioning via text_k, text_v, mask_text, text_lengths.
-            When None, model behaves exactly as original UniMoMo.
-            
-            If text_injection_mode=True:
-            - Pools text_v, projects to latent space, adds directly to H_0
-            - No attention to text (text_k, text_v not passed to diffusion)
-        '''
-
-        # encode latent_H_0 (N*d) and latent_X_0 (N*3)
+        """
+        Forward pass with optional sequence conditioning.
+        
+        Conditioning is handled by the configured conditioner:
+        - ESMConditioner: uses esm_embeddings
+        - LearnedAAConditioner: uses aa_indices
+        - QwenTextConditioner: uses text_v
+        - None: uses text_k, text_v for attention
+        """
+        # Encode structure to latent space
         with torch.no_grad():
             self.autoencoder.eval()
-            # encoding
             Zh, Zx, _, _, _, _, _, _ = self.autoencoder.encode(
-                X, S, A, bonds, chain_ids, generate_mask, block_lengths, lengths, deterministic=self.latent_deterministic
-            ) # [Nblock, d_latent], [Nblock, 3]
+                X, S, A, bonds, chain_ids, generate_mask, block_lengths, lengths,
+                deterministic=self.latent_deterministic
+            )
 
         position_embedding = self.position_encoding(position_ids)
 
-        # normalize
+        # Normalize positions
         batch_ids = length_to_batch_id(lengths)
         Zx, centers = self._normalize_position(Zx, batch_ids, center_mask)
 
         topo_embedding = self.topo_embedding(A, bonds, length_to_batch_id(block_lengths), generate_mask)
 
-        # is aa embedding (sample 50% for generation part)
+        # Is AA embedding (corrupt during training)
         corrupt_mask = generate_mask & (torch.rand_like(is_aa, dtype=torch.float) < self.is_aa_corrupt_ratio)
         is_aa_embedding = self.is_aa_embed(
             torch.where(corrupt_mask, torch.zeros_like(is_aa), is_aa).long()
         )
 
-        # condition embedding
+        # Base conditioning
         cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
 
-        # TEXT INJECTION MODE: Add text embedding to cond_embedding (conditioning signal)
-        # Per-residue embeddings with 1:1 token-residue mapping!
-        # This conditions the denoising process without modifying the target H_0
-        if self.text_injection_mode and text_v is not None and mask_text is not None:
-            # text_v: [B, L_text, hidden_dim] - Qwen hidden states (per-residue)
-            # Each token = one amino acid residue
-            if text_v.dim() == 4:
-                # Old format: [B, L_text, n_heads, head_dim] -> flatten
-                B, L_text, n_heads, head_dim = text_v.shape
-                text_v_flat = text_v.view(B, L_text, n_heads * head_dim)
-            else:
-                # New format: [B, L_text, hidden_dim] - direct hidden states
-                B, L_text, text_hidden_dim = text_v.shape
-                text_v_flat = text_v
-            
-            batch_size = lengths.shape[0]
-            
-            # Project each token to cond_embedding space: [B, L_text, hidden_size]
-            # Cast to same dtype as projection layer (Qwen outputs bfloat16, proj is float32)
-            proj_dtype = next(self.text_proj.parameters()).dtype
-            text_v_flat = text_v_flat.to(dtype=proj_dtype)
-            text_cond = self.text_proj(text_v_flat)  # [B, L_text, hidden_size]
-            
-            # Map tokens to residues 1:1
-            # cond_embedding: [Nblock, hidden_size] where Nblock = sum(lengths)
-            
-            # DEBUG: Print text injection stats
-            _debug_injection = True  # Set to True for debugging
-            if _debug_injection:
-                print(f"\n🔍 TEXT INJECTION DEBUG - LDM (cond_embedding mode):")
-                print(f"  text_v shape: {text_v.shape}, text_cond shape: {text_cond.shape}")
-                print(f"  text_cond stats: mean={text_cond.mean():.4f}, std={text_cond.std():.4f}")
-                print(f"  cond_embedding (before) stats: mean={cond_embedding.mean():.4f}, std={cond_embedding.std():.4f}")
-            
-            offset = 0
-            for sample_idx in range(batch_size):
-                sample_len = int(lengths[sample_idx].item())
-                sample_mask = generate_mask[offset:offset + sample_len]  # [sample_len]
-                
-                # Count CDR residues in this sample
-                n_cdr = int(sample_mask.sum().item())
-                
-                # Get valid text tokens for this sample
-                if text_lengths is not None:
-                    n_tokens = int(text_lengths[sample_idx].item())
-                elif mask_text is not None:
-                    n_tokens = int(mask_text[sample_idx].sum().item())
-                else:
-                    n_tokens = L_text
-                
-                # 1:1 mapping: tokens should match CDR residues
-                n_to_add = min(n_cdr, n_tokens)
-                
-                if _debug_injection and sample_idx < 2:
-                    print(f"  Sample {sample_idx}: n_cdr={n_cdr}, n_tokens={n_tokens}, n_to_add={n_to_add}")
-                
-                if n_to_add > 0:
-                    # Get CDR positions in this sample
-                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
-                    
-                    # Get text embeddings for this sample
-                    text_embed = text_cond[sample_idx, :n_to_add]  # [n_to_add, hidden_size]
-                    
-                    # Add to cond_embedding at CDR positions (conditioning signal)
-                    # Apply learnable scaling to balance text signal with other conditioning
-                    global_positions = offset + cdr_positions
-                    cond_embedding[global_positions] = cond_embedding[global_positions] + self.text_scale * text_embed
-                
-                offset += sample_len
-            
-            if _debug_injection:
-                print(f"  text_scale: {self.text_scale.item():.4f}")
-                print(f"  cond_embedding (after) stats: mean={cond_embedding.mean():.4f}, std={cond_embedding.std():.4f}")
-            
-            # AUXILIARY LOSS: Direct supervision for text_proj
-            # Predict H_0 (VAE latent) from text embeddings
-            text_h0_pred = self.text_h0_proj(text_cond)  # [B, L_text, latent_size]
-            
-            # Collect targets and predictions for auxiliary loss
-            aux_preds = []
-            aux_targets = []
-            offset = 0
-            for sample_idx in range(batch_size):
-                sample_len = int(lengths[sample_idx].item())
-                sample_mask = generate_mask[offset:offset + sample_len]
-                n_cdr = int(sample_mask.sum().item())
-                
-                if text_lengths is not None:
-                    n_tokens = int(text_lengths[sample_idx].item())
-                elif mask_text is not None:
-                    n_tokens = int(mask_text[sample_idx].sum().item())
-                else:
-                    n_tokens = text_h0_pred.shape[1]
-                
-                n_to_match = min(n_cdr, n_tokens)
-                if n_to_match > 0:
-                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_match]
-                    global_positions = offset + cdr_positions
-                    
-                    # Target: H_0 at CDR positions
-                    h0_target = Zh[global_positions]  # [n_to_match, latent_size]
-                    # Prediction: text_h0_proj output
-                    h0_pred = text_h0_pred[sample_idx, :n_to_match]  # [n_to_match, latent_size]
-                    
-                    aux_preds.append(h0_pred)
-                    aux_targets.append(h0_target)
-                
-                offset += sample_len
-            
-            # Compute auxiliary loss
-            if aux_preds:
-                aux_preds_cat = torch.cat(aux_preds, dim=0)
-                aux_targets_cat = torch.cat(aux_targets, dim=0)
-                aux_loss = F.mse_loss(aux_preds_cat, aux_targets_cat)
-                
-                if _debug_injection:
-                    print(f"  🎯 AUX LOSS: {aux_loss.item():.4f} (direct text→H_0 supervision)")
-            else:
-                aux_loss = torch.tensor(0.0, device=Zh.device)
-            
-            # Store for later addition to total loss
-            self._aux_loss = aux_loss
-            
-            # Disable attention to text (we're using direct injection)
-            text_k, text_v, mask_text, text_lengths = None, None, None, None
+        # Apply sequence conditioning via conditioner
+        aux_loss = None
+        if self.conditioner is not None:
+            embeddings = self._get_conditioning_embeddings(
+                esm_embeddings=esm_embeddings,
+                aa_indices=aa_indices,
+                text_v=text_v,
+            )
+            if embeddings is not None:
+                cond_embedding, aux_loss = self.conditioner.forward(
+                    embeddings=embeddings,
+                    cond_embedding=cond_embedding,
+                    generate_mask=generate_mask,
+                    lengths=lengths,
+                    Zh=Zh,
+                    mask_text=mask_text,
+                    text_lengths=text_lengths,
+                )
+                # Disable attention conditioning when using conditioner
+                text_k, text_v, mask_text, text_lengths = None, None, None, None
 
-        # LEARNED AA EMBEDDING MODE: Simple direct AA → H_0 mapping
-        # This is the simplest possible shortcut test
-        if self.use_learned_aa_embed and aa_indices is not None:
-            batch_size = lengths.shape[0]
-            B, L_aa = aa_indices.shape
-            
-            # aa_indices: [B, L_aa] - indices into self.aa_embed
-            # Get AA embeddings: [B, L_aa, latent_size]
-            aa_embed_raw = self.aa_embed(aa_indices)
-            
-            # Add position embeddings (0, 1, 2, ... for each position in CDR)
-            pos_indices = torch.arange(L_aa, device=aa_indices.device).unsqueeze(0).expand(B, -1)
-            pos_indices = pos_indices.clamp(max=49)  # Clamp to max position
-            pos_embed = self.aa_pos_embed(pos_indices)  # [B, L_aa, latent_size]
-            
-            # Combine: AA identity + position
-            aa_h0_pred = aa_embed_raw + pos_embed  # [B, L_aa, latent_size]
-            
-            # Project to cond_embedding space for conditioning
-            aa_cond = self.aa_cond_proj(aa_h0_pred)  # [B, L_aa, hidden_size]
-            
-            # DEBUG
-            _debug_aa = True
-            if _debug_aa:
-                print(f"\n🔤 LEARNED AA EMBED DEBUG (with position):")
-                print(f"  aa_indices shape: {aa_indices.shape}")
-                print(f"  aa_embed_raw stats: mean={aa_embed_raw.mean():.4f}, std={aa_embed_raw.std():.4f}")
-                print(f"  pos_embed stats: mean={pos_embed.mean():.4f}, std={pos_embed.std():.4f}")
-                print(f"  aa_h0_pred (aa+pos) stats: mean={aa_h0_pred.mean():.4f}, std={aa_h0_pred.std():.4f}")
-                print(f"  aa_cond stats: mean={aa_cond.mean():.4f}, std={aa_cond.std():.4f}")
-            
-            # Add to cond_embedding at CDR positions
-            aux_preds = []
-            aux_targets = []
-            offset = 0
-            for sample_idx in range(batch_size):
-                sample_len = int(lengths[sample_idx].item())
-                sample_mask = generate_mask[offset:offset + sample_len]
-                n_cdr = int(sample_mask.sum().item())
-                
-                # Get valid AA count for this sample
-                n_aa = (aa_indices[sample_idx] >= 0).sum().item()  # Assuming -1 or padding uses 0
-                n_to_add = min(n_cdr, n_aa)
-                
-                if n_to_add > 0:
-                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
-                    global_positions = offset + cdr_positions
-                    
-                    # Add AA cond to cond_embedding
-                    aa_cond_sample = aa_cond[sample_idx, :n_to_add]
-                    cond_embedding[global_positions] = cond_embedding[global_positions] + self.aa_scale * aa_cond_sample
-                    
-                    # Collect for auxiliary loss: direct AA → H_0 prediction
-                    h0_target = Zh[global_positions]  # [n_to_add, latent_size]
-                    h0_pred = aa_h0_pred[sample_idx, :n_to_add]  # [n_to_add, latent_size]
-                    aux_preds.append(h0_pred)
-                    aux_targets.append(h0_target)
-                
-                offset += sample_len
-            
-            # Compute auxiliary loss
-            if aux_preds:
-                aux_preds_cat = torch.cat(aux_preds, dim=0)
-                aux_targets_cat = torch.cat(aux_targets, dim=0)
-                aux_loss = F.mse_loss(aux_preds_cat, aux_targets_cat)
-                
-                if _debug_aa:
-                    print(f"  🎯 AA AUX LOSS: {aux_loss.item():.4f} (direct AA→H_0)")
-                    print(f"  aa_scale: {self.aa_scale.item():.4f}")
-            else:
-                aux_loss = torch.tensor(0.0, device=Zh.device)
-            
-            self._aux_loss = aux_loss
-            
-            # No attention conditioning
-            text_k, text_v, mask_text, text_lengths = None, None, None, None
-
-        # ESM EMBEDDING MODE: Use ESM for both sequence and structure
-        # esm_h0_proj trains to predict H_0 from ESM (with aux_loss)
-        # esm_cond_proj provides conditioning signal via cond_embedding
-        if self.use_esm_embed and esm_embeddings is not None:
-            batch_size = lengths.shape[0]
-            B, L_esm, esm_dim = esm_embeddings.shape
-            
-            # CHAINED projection: ESM → esm_cond → esm_h0_pred
-            # Gradients from aux_loss flow through BOTH projections
-            proj_dtype = next(self.esm_cond_proj.parameters()).dtype
-            esm_embeddings = esm_embeddings.to(dtype=proj_dtype)
-            esm_cond = self.esm_cond_proj(esm_embeddings)   # [B, L_esm, hidden_size]
-            esm_h0_pred = self.esm_h0_proj(esm_cond)        # [B, L_esm, latent_size]
-            
-            # DEBUG
-            _debug_esm = True
-            if _debug_esm:
-                print(f"\n🧬 ESM EMBED DEBUG:")
-                print(f"  ESM device: {esm_embeddings.device}, dtype: {esm_embeddings.dtype}")
-                print(f"  esm_embeddings shape: {esm_embeddings.shape}")
-                print(f"  esm_h0_pred stats: mean={esm_h0_pred.mean():.4f}, std={esm_h0_pred.std():.4f}")
-                print(f"  esm_cond stats: mean={esm_cond.mean():.4f}, std={esm_cond.std():.4f}")
-                print(f"  H_0 (target) stats: mean={Zh.mean():.4f}, std={Zh.std():.4f}")
-            
-            # Process each sample
-            aux_preds = []
-            aux_targets = []
-            offset = 0
-            for sample_idx in range(batch_size):
-                sample_len = int(lengths[sample_idx].item())
-                sample_mask = generate_mask[offset:offset + sample_len]
-                n_cdr = int(sample_mask.sum().item())
-                n_to_add = min(n_cdr, L_esm)
-                
-                if n_to_add > 0:
-                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
-                    global_positions = offset + cdr_positions
-                    
-                    # Add ESM to cond_embedding (this is the diffusion input conditioning)
-                    esm_cond_sample = esm_cond[sample_idx, :n_to_add]
-                    cond_embedding[global_positions] = cond_embedding[global_positions] + self.esm_scale * esm_cond_sample
-                    
-                    # Collect for auxiliary loss: supervise esm_h0_proj to predict H_0
-                    h0_pred = esm_h0_pred[sample_idx, :n_to_add]  # [n_to_add, latent_size]
-                    h0_target = Zh[global_positions]  # [n_to_add, latent_size]
-                    aux_preds.append(h0_pred)
-                    aux_targets.append(h0_target)
-                
-                offset += sample_len
-            
-            # Compute auxiliary loss: direct ESM → H_0 supervision
-            if aux_preds:
-                aux_preds_cat = torch.cat(aux_preds, dim=0)
-                aux_targets_cat = torch.cat(aux_targets, dim=0)
-                aux_loss = F.mse_loss(aux_preds_cat, aux_targets_cat)
-                
-                if _debug_esm:
-                    print(f"  🎯 ESM AUX LOSS: {aux_loss.item():.4f}")
-                    print(f"  esm_scale: {self.esm_scale.item():.4f}")
-                    # Per-AA analysis: check if certain AAs are harder
-                    residual = (aux_preds_cat - aux_targets_cat).abs()
-                    print(f"  Residual: mean={residual.mean():.4f}, max={residual.max():.4f}")
-            else:
-                aux_loss = torch.tensor(0.0, device=Zh.device)
-            
-            self._aux_loss = aux_loss
-            
-            # No attention conditioning
-            text_k, text_v, mask_text, text_lengths = None, None, None, None
-
+        # Run diffusion
         loss_dict = self.diffusion.forward(
             H_0=Zh,
             X_0=Zx,
@@ -537,55 +278,56 @@ class LDMMolDesign(nn.Module):
             t=t,
         )
 
-        # loss - RESTORED: Original UniMoMo formula with h_loss_weight
+        # Compute total loss
         loss_dict['total'] = loss_dict['H'] * self.h_loss_weight + loss_dict['X']
 
-        # Add auxiliary loss for text/AA/ESM injection modes (direct → H_0 supervision)
-        if hasattr(self, '_aux_loss'):
-            aux_loss = self._aux_loss
+        # Add auxiliary loss if computed
+        if aux_loss is not None:
             loss_dict['aux_loss'] = aux_loss
             loss_dict['total'] = loss_dict['total'] + self.aux_loss_weight * aux_loss
-            del self._aux_loss  # Clean up
 
-        # Log scale parameters
-        if self.text_injection_mode and hasattr(self, 'text_scale'):
-            loss_dict['text_scale'] = self.text_scale.detach()
-        if self.use_learned_aa_embed and hasattr(self, 'aa_scale'):
-            loss_dict['aa_scale'] = self.aa_scale.detach()
-        if self.use_esm_embed and hasattr(self, 'esm_scale'):
-            loss_dict['esm_scale'] = self.esm_scale.detach()
+        # Log conditioner scale
+        if self.conditioner is not None and hasattr(self.conditioner, 'scale'):
+            loss_dict[f'{self.conditioner.name}_scale'] = self.conditioner.scale.detach()
 
         return loss_dict
 
-    # def latent_geometry_guidance(self, X, generate_mask, batch_ids, tolerance=3, **kwargs):
-    #     assert self.consec_dist_mean is not None and self.consec_dist_std is not None, \
-    #            'Please run set_consec_dist(self, mean, std) to setup guidance parameters'
-    #     return dist_energy(
-    #         X, generate_mask, batch_ids,
-    #         self.consec_dist_mean, self.consec_dist_std,
-    #         tolerance=tolerance, **kwargs
-    #     )
+    def _get_conditioning_embeddings(
+        self,
+        esm_embeddings=None,
+        aa_indices=None,
+        text_v=None,
+    ):
+        """Get the appropriate embeddings for the current conditioner."""
+        if self.use_esm_embed and esm_embeddings is not None:
+            return esm_embeddings
+        elif self.use_learned_aa_embed and aa_indices is not None:
+            return aa_indices
+        elif self.text_injection_mode and text_v is not None:
+            return text_v
+        return None
 
+    # ========== TOPOLOGY EMBEDDING ==========
     def topo_embedding(self, A, bonds, block_ids, generate_mask):
         ctx_mask = ~generate_mask[block_ids]
 
-        # only retain bonds in the context
+        # Only retain bonds in the context
         bond_select_mask = ctx_mask[bonds[:, 0]] & ctx_mask[bonds[:, 1]]
         bonds = bonds[bond_select_mask]
 
-        # embed bond type
+        # Embed bond type
         edge_attr = self.bond_embed(bonds[:, 2])
         
-        # embed atom type
+        # Embed atom type
         H = self.atom_embed(A)
 
-        # get topo embedding
-        topo_embedding = self.topo_gnn(H, bonds[:, :2].T, edge_attr) # [Natom]
+        # Get topo embedding
+        topo_embedding = self.topo_gnn(H, bonds[:, :2].T, edge_attr)
 
-        # aggregate to each block
-        topo_embedding = std_conserve_scatter_mean(topo_embedding, block_ids, dim=0) # [Nblock]
+        # Aggregate to each block
+        topo_embedding = std_conserve_scatter_mean(topo_embedding, block_ids, dim=0)
 
-        # set generation part to zero
+        # Set generation part to zero
         topo_embedding = torch.where(
             generate_mask[:, None].expand_as(topo_embedding),
             torch.zeros_like(topo_embedding),
@@ -594,10 +336,10 @@ class LDMMolDesign(nn.Module):
 
         return topo_embedding
 
+    # ========== POSITION NORMALIZATION ==========
     def _normalize_position(self, X, batch_ids, center_mask):
-        # TODO: pass in centers from dataset, which might be better for antibody (custom center)
-        centers = scatter_mean(X[center_mask], batch_ids[center_mask], dim=0, dim_size=batch_ids.max() + 1) # [bs, 3]
-        centers = centers[batch_ids] # [N, 3]
+        centers = scatter_mean(X[center_mask], batch_ids[center_mask], dim=0, dim_size=batch_ids.max() + 1)
+        centers = centers[batch_ids]
         X = (X - centers) / self.std
         return X, centers
 
@@ -605,191 +347,82 @@ class LDMMolDesign(nn.Module):
         X = X_norm * self.std + centers
         return X
 
+    # ========== SAMPLING ==========
     @torch.no_grad()
     def sample(
             self,
-            X,              # [Natom, 3], atom coordinates     
-            S,              # [Nblock], block types
-            A,              # [Natom], atom types
-            bonds,          # [Nbonds, 3], chemical bonds, src-dst-type (single: 1, double: 2, triple: 3)
-            position_ids,   # [Nblock], block position ids
-            chain_ids,      # [Nblock], split different chains
-            generate_mask,  # [Nblock], 1 for generation, 0 for context
-            center_mask,    # [Nblock], 1 for calculating complex mass center
-            block_lengths,  # [Nblock], number of atoms in each block
-            lengths,        # [batch_size]
-            is_aa,          # [Nblock], 1 for amino acid (for determining the X_mask in inverse folding)
-            text_k=None,    # Optional: [B, L_text, n_kv_heads, d_head] text key features
-            text_v=None,    # Optional: [B, L_text, n_kv_heads, d_head] text value features
-            mask_text=None, # Optional: [B, L_text] text attention mask
-            text_lengths=None,  # Optional: [B] actual text lengths for RoPE
-            aa_indices=None,  # Optional: [B, L_aa] amino acid indices for learned AA embed mode
-            esm_embeddings=None,  # Optional: [B, L_aa, 1280] ESM per-residue embeddings
-            sample_opt={
-                'pbar': False,
-                # 'energy_func': None,
-                # 'energy_lambda': 0.0,
-            },
+            X,
+            S,
+            A,
+            bonds,
+            position_ids,
+            chain_ids,
+            generate_mask,
+            center_mask,
+            block_lengths,
+            lengths,
+            is_aa,
+            # Conditioning inputs
+            text_k=None,
+            text_v=None,
+            mask_text=None,
+            text_lengths=None,
+            aa_indices=None,
+            esm_embeddings=None,
+            sample_opt={},
             return_tensor=False,
         ):
-        '''
-            Sample from the diffusion model with optional text conditioning.
-            When text_k, text_v, mask_text, text_lengths are provided, the generation is conditioned on text embeddings.
-            When aa_indices is provided and use_learned_aa_embed=True, uses learned AA embeddings for conditioning.
-        '''
-
+        """
+        Sample from the diffusion model with optional conditioning.
+        """
         vae_decode_n_iter = sample_opt.pop('vae_decode_n_iter', 10)
 
         block_ids = length_to_batch_id(block_lengths)
 
-        # ensure there is no data leakage
+        # Ensure no data leakage
         S[generate_mask] = 0
         X[generate_mask[block_ids]] = 0
         A[generate_mask[block_ids]] = 0
         ctx_atom_mask = ~generate_mask[block_ids]
         bonds = bonds[ctx_atom_mask[bonds[:, 0]] & ctx_atom_mask[bonds[:, 1]]]
 
-        # encoding context
+        # Encode context
         self.autoencoder.eval()
-        Zh, Zx, _, signed_Zx_log_var, _, _, _, _ = self.autoencoder.encode(
-            X, S, A, bonds, chain_ids, generate_mask, block_lengths, lengths, deterministic=self.latent_deterministic
-        ) # [Nblock, d_latent], [Nblock, 3]
+        Zh, Zx, _, _, _, _, _, _ = self.autoencoder.encode(
+            X, S, A, bonds, chain_ids, generate_mask, block_lengths, lengths,
+            deterministic=self.latent_deterministic
+        )
 
-        # if 'energy_func' in sample_opt:
-        #     if sample_opt['energy_func'] is None:
-        #         pass
-        #     elif sample_opt['energy_func'] == 'default':
-        #         sample_opt['energy_func'] = self.latent_geometry_guidance
-        #     # otherwise this should be a function
-        
-
-        # normalize
+        # Normalize positions
         batch_ids = length_to_batch_id(lengths)
         Zx, centers = self._normalize_position(Zx, batch_ids, center_mask)
 
-        # topo embedding for structure prediction
+        # Build conditioning
         topo_embedding = self.topo_embedding(A, bonds, length_to_batch_id(block_lengths), generate_mask)
-        
-        # position embedding
         position_embedding = self.position_encoding(position_ids)
-
-        # is aa embedding
         is_aa_embedding = self.is_aa_embed(is_aa.long())
-        
-        # condition embedding
         cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
-        
-        # LEARNED AA EMBEDDING MODE: Use simple learned AA embeddings for conditioning
-        if self.use_learned_aa_embed and aa_indices is not None:
-            batch_size = lengths.shape[0]
-            
-            # Get position indices for position embedding
-            max_len = aa_indices.shape[1]
-            pos_indices = torch.arange(max_len, device=aa_indices.device).unsqueeze(0).expand_as(aa_indices)
-            
-            # Get AA embeddings with position
-            aa_embed_raw = self.aa_embed(aa_indices)       # [B, L_aa, latent_size]
-            pos_embed = self.aa_pos_embed(pos_indices)     # [B, L_aa, latent_size]
-            aa_h0_pred = aa_embed_raw + pos_embed          # Combined
-            
-            # Project to cond_embedding space
-            aa_cond = self.aa_cond_proj(aa_h0_pred)        # [B, L_aa, hidden_size]
-            
-            # Add to cond_embedding at generate_mask positions
-            offset = 0
-            for sample_idx in range(batch_size):
-                sample_len = int(lengths[sample_idx].item())
-                sample_mask = generate_mask[offset:offset + sample_len]
-                n_cdr = int(sample_mask.sum().item())
-                n_aa = aa_indices.shape[1]
-                n_to_add = min(n_cdr, n_aa)
-                
-                if n_to_add > 0:
-                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
-                    aa_embed = aa_cond[sample_idx, :n_to_add]  # [n_to_add, hidden_size]
-                    global_positions = offset + cdr_positions
-                    cond_embedding[global_positions] = cond_embedding[global_positions] + self.aa_scale * aa_embed
-                
-                offset += sample_len
-            
-            # In learned AA embed mode, disable attention-based text conditioning
-            text_k, text_v, mask_text, text_lengths = None, None, None, None
-        
-        # TEXT INJECTION MODE: Add text embedding to cond_embedding during sampling
-        elif self.text_injection_mode and text_v is not None and mask_text is not None:
-            if text_v.dim() == 4:
-                B, L_text, n_heads, head_dim = text_v.shape
-                text_v_flat = text_v.view(B, L_text, n_heads * head_dim)
-            else:
-                B, L_text, text_hidden_dim = text_v.shape
-                text_v_flat = text_v
-            
-            batch_size = lengths.shape[0]
-            proj_dtype = next(self.text_proj.parameters()).dtype
-            text_v_flat = text_v_flat.to(dtype=proj_dtype)
-            text_cond = self.text_proj(text_v_flat)  # [B, L_text, hidden_size]
-            
-            offset = 0
-            for sample_idx in range(batch_size):
-                sample_len = int(lengths[sample_idx].item())
-                sample_mask = generate_mask[offset:offset + sample_len]
-                n_cdr = int(sample_mask.sum().item())
-                
-                if text_lengths is not None:
-                    n_tokens = int(text_lengths[sample_idx].item())
-                elif mask_text is not None:
-                    n_tokens = int(mask_text[sample_idx].sum().item())
-                else:
-                    n_tokens = L_text
-                
-                n_to_add = min(n_cdr, n_tokens)
-                
-                if n_to_add > 0:
-                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
-                    text_embed = text_cond[sample_idx, :n_to_add]
-                    global_positions = offset + cdr_positions
-                    cond_embedding[global_positions] = cond_embedding[global_positions] + self.text_scale * text_embed
-                
-                offset += sample_len
-            
-            # In text injection mode, we don't use attention
-            text_k, text_v, mask_text, text_lengths = None, None, None, None
-        
-        # ESM EMBEDDING MODE: Use ESM for sampling
-        # KEY: Use esm_h0_proj prediction as H_prior for diffusion initialization
-        # ESM conditioning: add esm_cond to cond_embedding (structural context)
-        # Note: aux_loss trains esm_h0_proj but we don't use H_prior at inference
-        # to maintain train-test consistency (training always starts from random noise)
-        if self.use_esm_embed and esm_embeddings is not None:
-            batch_size = lengths.shape[0]
-            B, L_esm, esm_dim = esm_embeddings.shape
-            
-            # Project ESM to conditioning space
-            proj_dtype = next(self.esm_cond_proj.parameters()).dtype
-            esm_embeddings = esm_embeddings.to(dtype=proj_dtype)
-            esm_cond = self.esm_cond_proj(esm_embeddings)   # [B, L_esm, hidden_size]
-            
-            # Add ESM conditioning to cond_embedding at CDR positions
-            offset = 0
-            for sample_idx in range(batch_size):
-                sample_len = int(lengths[sample_idx].item())
-                sample_mask = generate_mask[offset:offset + sample_len]
-                n_cdr = int(sample_mask.sum().item())
-                n_to_add = min(n_cdr, L_esm)
-                
-                if n_to_add > 0:
-                    cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_add]
-                    global_positions = offset + cdr_positions
-                    
-                    # Add ESM to cond_embedding
-                    esm_embed = esm_cond[sample_idx, :n_to_add]
-                    cond_embedding[global_positions] = cond_embedding[global_positions] + self.esm_scale * esm_embed
-                
-                offset += sample_len
-            
-            # In ESM mode, we don't use attention
-            text_k, text_v, mask_text, text_lengths = None, None, None, None
-        
+
+        # Apply sequence conditioning
+        if self.conditioner is not None:
+            embeddings = self._get_conditioning_embeddings(
+                esm_embeddings=esm_embeddings,
+                aa_indices=aa_indices,
+                text_v=text_v,
+            )
+            if embeddings is not None:
+                cond_embedding = self.conditioner.condition_sample(
+                    embeddings=embeddings,
+                    cond_embedding=cond_embedding,
+                    generate_mask=generate_mask,
+                    lengths=lengths,
+                    mask_text=mask_text,
+                    text_lengths=text_lengths,
+                )
+                # Disable attention conditioning
+                text_k, text_v, mask_text, text_lengths = None, None, None, None
+
+        # Run diffusion sampling
         traj = self.diffusion.sample(
             H=Zh,
             X=Zx,
@@ -807,13 +440,77 @@ class LDMMolDesign(nn.Module):
         X_0 = torch.where(generate_mask[:, None].expand_as(X_0), X_0, Zx)
         H_0 = torch.where(generate_mask[:, None].expand_as(H_0), H_0, Zh)
 
-        # unnormalize
+        # Unnormalize
         X_0 = self._unnormalize_position(X_0, centers, batch_ids)
 
-        # autodecoder decode
+        # VAE decode
         return self.autoencoder.generate(
             X=X, S=S, A=A, bonds=bonds, position_ids=position_ids,
             chain_ids=chain_ids, generate_mask=generate_mask, block_lengths=block_lengths,
             lengths=lengths, is_aa=is_aa, given_latent=(H_0, X_0, None),
             n_iter=vae_decode_n_iter, topo_generate_mask=generate_mask
         )
+
+    # ========== CONVENIENCE PROPERTIES FOR ESM ==========
+    @property
+    def esm_model(self):
+        """Get ESM model from conditioner (for extraction)."""
+        if hasattr(self, '_esm_conditioner') and self._esm_conditioner is not None:
+            self._esm_conditioner._load_esm_model()
+            return self._esm_conditioner.esm_model
+        return None
+
+    @property
+    def esm_alphabet(self):
+        """Get ESM alphabet from conditioner."""
+        if hasattr(self, '_esm_conditioner') and self._esm_conditioner is not None:
+            self._esm_conditioner._load_esm_model()
+            return self._esm_conditioner.esm_alphabet
+        return None
+
+    @property
+    def esm_batch_converter(self):
+        """Get ESM batch converter from conditioner."""
+        if hasattr(self, '_esm_conditioner') and self._esm_conditioner is not None:
+            self._esm_conditioner._load_esm_model()
+            return self._esm_conditioner.esm_batch_converter
+        return None
+
+    # ========== BACKWARD COMPATIBILITY ==========
+    # These properties maintain backward compatibility with code that
+    # accesses conditioner attributes directly on LDM
+    
+    @property
+    def text_scale(self):
+        """Get text scale from Qwen conditioner."""
+        if self.conditioner is not None and hasattr(self.conditioner, 'scale'):
+            return self.conditioner.scale
+        return None
+
+    @property
+    def aa_scale(self):
+        """Get AA scale from learned AA conditioner."""
+        if self.conditioner is not None and hasattr(self.conditioner, 'scale'):
+            return self.conditioner.scale
+        return None
+
+    @property
+    def esm_scale(self):
+        """Get ESM scale from ESM conditioner."""
+        if self.conditioner is not None and hasattr(self.conditioner, 'scale'):
+            return self.conditioner.scale
+        return None
+
+    @property
+    def aa_vocab(self):
+        """Get AA vocab from learned AA conditioner."""
+        if isinstance(self.conditioner, LearnedAAConditioner):
+            return self.conditioner.AA_VOCAB
+        return None
+
+    @property
+    def aa_to_idx(self):
+        """Get AA to index mapping from learned AA conditioner."""
+        if isinstance(self.conditioner, LearnedAAConditioner):
+            return self.conditioner.aa_to_idx
+        return None
