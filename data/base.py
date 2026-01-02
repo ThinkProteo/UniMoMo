@@ -293,11 +293,27 @@ class BaseDataset(MMAPDataset):
                 # Store raw GT sequence - text_injection_mode will tokenize per-residue
                 # Validate that ref_seq is an actual amino acid sequence
                 valid_aas = set("ACDEFGHIKLMNPQRSTVWY")
-                if not summary.ref_seq or not all(aa.upper() in valid_aas for aa in summary.ref_seq):
-                    raise ValueError(f"Invalid ref_seq for {summary.id}: '{summary.ref_seq}' "
-                                   f"is not a valid amino acid sequence")
-                data['response_qkv_text'] = summary.ref_seq
-                data['gt_seq_for_injection'] = summary.ref_seq  # Raw sequence for per-residue tokenization
+                ref_seq = summary.ref_seq
+                
+                # Try to clean corrupted sequences (e.g., '5f274f214NSLRAEDTAV' -> 'NSLRAEDTAV')
+                if ref_seq and not all(aa.upper() in valid_aas for aa in ref_seq):
+                    # Find where valid AA sequence starts
+                    clean_start = 0
+                    for i, c in enumerate(ref_seq):
+                        if c.upper() in valid_aas:
+                            clean_start = i
+                            break
+                    cleaned_seq = ref_seq[clean_start:]
+                    if cleaned_seq and all(aa.upper() in valid_aas for aa in cleaned_seq):
+                        print(f"⚠️ Cleaned corrupted ref_seq for {summary.id}: '{ref_seq}' -> '{cleaned_seq}'")
+                        ref_seq = cleaned_seq
+                    else:
+                        print(f"⚠️ Skipping invalid ref_seq for {summary.id}: '{summary.ref_seq}'")
+                        ref_seq = None
+                
+                if ref_seq:
+                    data['response_qkv_text'] = ref_seq
+                    data['gt_seq_for_injection'] = ref_seq  # Raw sequence for per-residue tokenization
                 if data.get('raw_text'):
                     data['raw_text'] = dict(data['raw_text'])  # Make a copy to avoid mutating cache
                     data['raw_text']['thinking'] = summary.ref_seq  # GT seq becomes thinking content
