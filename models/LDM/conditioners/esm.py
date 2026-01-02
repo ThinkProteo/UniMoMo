@@ -40,6 +40,7 @@ class ESMConditioner(BaseConditioner):
         latent_size: int,
         esm_model_name: str = "esm2_t33_650M_UR50D",
         esm_embed_dim: int = 1280,  # ESM-2 650M hidden size
+        esm_layer: int = 30,  # Layer 30 embeddings (not last layer 33)
         aux_loss_weight: float = 1.0,
         debug: bool = True,
     ):
@@ -47,6 +48,7 @@ class ESMConditioner(BaseConditioner):
         
         self.esm_model_name = esm_model_name
         self.esm_embed_dim = esm_embed_dim
+        self.esm_layer = esm_layer
         
         # ESM model (loaded on demand to avoid import errors)
         self.esm_model = None
@@ -78,7 +80,7 @@ class ESMConditioner(BaseConditioner):
         )
         
         print(f"📌 {self.name} (conditioning FROM supervised rep):")
-        print(f"   ESM-2 ({esm_embed_dim}) → esm_h0_proj → H_0 ({latent_size}) [SUPERVISED]")
+        print(f"   ESM-2 layer {esm_layer} ({esm_embed_dim}) → esm_h0_proj → H_0 ({latent_size}) [SUPERVISED]")
         print(f"   H_0 ({latent_size}) → esm_h0_to_cond → cond ({hidden_size})")
         print(f"   ✓ Conditioning derived FROM supervised representation (like learned_aa)")
     
@@ -98,7 +100,7 @@ class ESMConditioner(BaseConditioner):
             self.esm_model.eval()
             for param in self.esm_model.parameters():
                 param.requires_grad = False
-            print(f"✓ {self.name}: Loaded ESM-2 650M")
+            print(f"✓ {self.name}: Loaded ESM-2 650M (using layer {self.esm_layer})")
         except ImportError:
             raise ImportError("ESM not installed! Run: pip install fair-esm")
     
@@ -126,13 +128,14 @@ class ESMConditioner(BaseConditioner):
         # Move ESM model to device if needed
         self.esm_model = self.esm_model.to(device)
         
-        # Extract representations
+        # Extract representations from specified layer
         with torch.no_grad():
-            results = self.esm_model(batch_tokens, repr_layers=[33], return_contacts=False)
+            results = self.esm_model(batch_tokens, repr_layers=[self.esm_layer], return_contacts=False)
         
-        # Get per-residue embeddings from last layer
+        # Get per-residue embeddings from specified layer (not last layer)
+        # Layer 30 often better than layer 33 for structural tasks
         # Shape: [B, seq_len + 2, esm_embed_dim] (includes BOS/EOS)
-        token_representations = results["representations"][33]
+        token_representations = results["representations"][self.esm_layer]
         
         # Remove BOS/EOS tokens
         embeddings = token_representations[:, 1:-1, :]
