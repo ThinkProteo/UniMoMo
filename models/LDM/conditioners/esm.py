@@ -19,17 +19,19 @@ class ESMConditioner(BaseConditioner):
     """
     Conditioner using ESM-2 protein language model embeddings.
     
-    Architecture:
+    Architecture (matches learned_aa_embed pattern):
     - esm_model: Frozen ESM-2 model (loaded on demand)
-    - esm_cond_proj: Projects ESM embeddings to cond_embedding space
-    - esm_h0_proj: Projects esm_cond to H_0 for auxiliary supervision (CHAINED)
+    - esm_h0_proj: ESM → H_0 (latent_size) - SUPERVISED by aux_loss
+    - esm_h0_to_cond: H_0 → conditioning (hidden_size)
     - esm_scale: Learnable scaling factor
     
-    The chained architecture (ESM → esm_cond → esm_h0) ensures gradients
-    from aux_loss flow through both projection layers.
+    Key insight: Conditioning must come FROM the supervised representation.
+    This matches learned_aa_embed which achieves AAR ≈ 1.0:
     
-    Note: ESM embeddings are contextual, so the same AA can have different
-    embeddings depending on surrounding sequence context.
+    learned_aa:  aa_indices → aa_embed (SUPERVISED) → aa_cond_proj → cond
+    ESM:         esm_embed → esm_h0_proj (SUPERVISED) → esm_h0_to_cond → cond
+    
+    Both derive conditioning FROM the aux_loss supervised representation.
     """
     
     def __init__(
@@ -51,20 +53,14 @@ class ESMConditioner(BaseConditioner):
         self.esm_alphabet = None
         self.esm_batch_converter = None
         
-        # CHAINED projection architecture:
-        # ESM → esm_cond_proj → esm_cond → esm_h0_proj → H_0
-        # This ensures gradients flow through both projections
+        # Architecture matching learned_aa_embed (which works):
+        # ESM → esm_h0_proj → esm_h0_pred (SUPERVISED) → esm_h0_to_cond → conditioning
+        # The key: conditioning must come FROM the supervised representation!
         
-        # Step 1: Project ESM to cond_embedding space
-        self.esm_cond_proj = nn.Sequential(
+        # Step 1: Project ESM to H_0 space (this is SUPERVISED by aux_loss)
+        self.esm_h0_proj = nn.Sequential(
             nn.Linear(esm_embed_dim, hidden_size),
             nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-        )
-        
-        # Step 2: Project esm_cond to H_0 (for aux_loss)
-        # Input is hidden_size (from esm_cond_proj), NOT esm_embed_dim
-        self.esm_h0_proj = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.SiLU(),
             nn.Linear(hidden_size // 2, latent_size),
@@ -73,10 +69,18 @@ class ESMConditioner(BaseConditioner):
         nn.init.normal_(self.esm_h0_proj[-1].weight, mean=0.0, std=0.1)
         nn.init.zeros_(self.esm_h0_proj[-1].bias)
         
-        print(f"📌 {self.name} (chained projection):")
-        print(f"   ESM-2 ({esm_embed_dim}) → esm_cond_proj → cond ({hidden_size})")
-        print(f"   cond ({hidden_size}) → esm_h0_proj → H_0 ({latent_size})")
-        print(f"   Gradients flow: aux_loss → esm_h0_proj → esm_cond_proj")
+        # Step 2: Project esm_h0_pred (supervised) → conditioning space
+        # This is analogous to aa_cond_proj in learned_aa_embed
+        self.esm_h0_to_cond = nn.Sequential(
+            nn.Linear(latent_size, hidden_size // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_size // 2, hidden_size),
+        )
+        
+        print(f"📌 {self.name} (conditioning FROM supervised rep):")
+        print(f"   ESM-2 ({esm_embed_dim}) → esm_h0_proj → H_0 ({latent_size}) [SUPERVISED]")
+        print(f"   H_0 ({latent_size}) → esm_h0_to_cond → cond ({hidden_size})")
+        print(f"   ✓ Conditioning derived FROM supervised representation (like learned_aa)")
     
     @property
     def name(self) -> str:
@@ -165,24 +169,28 @@ class ESMConditioner(BaseConditioner):
         """
         B, L_esm, esm_dim = embeddings.shape
         
-        # CHAINED projection: ESM → esm_cond → esm_h0_pred
-        proj_dtype = next(self.esm_cond_proj.parameters()).dtype
+        # Step 1: ESM → esm_h0_pred (SUPERVISED by aux_loss)
+        proj_dtype = next(self.esm_h0_proj.parameters()).dtype
         embeddings = embeddings.to(dtype=proj_dtype)
-        esm_cond = self.esm_cond_proj(embeddings)   # [B, L, hidden_size]
-        esm_h0_pred = self.esm_h0_proj(esm_cond)    # [B, L, latent_size]
+        esm_h0_pred = self.esm_h0_proj(embeddings)  # [B, L, latent_size] - SUPERVISED
+        
+        # Step 2: esm_h0_pred → conditioning (derived FROM supervised rep)
+        esm_cond = self.esm_h0_to_cond(esm_h0_pred)  # [B, L, hidden_size]
         
         self._debug_print(f"\n🧬 {self.name} DEBUG:")
         self._debug_print(f"  ESM embeddings shape: {embeddings.shape}")
-        self._debug_print(f"  esm_cond stats: mean={esm_cond.mean():.4f}, std={esm_cond.std():.4f}")
-        self._debug_print(f"  esm_h0_pred stats: mean={esm_h0_pred.mean():.4f}, std={esm_h0_pred.std():.4f}")
+        self._debug_print(f"  esm_h0_pred (supervised) stats: mean={esm_h0_pred.mean():.4f}, std={esm_h0_pred.std():.4f}")
+        self._debug_print(f"  esm_cond (from h0_pred) stats: mean={esm_cond.mean():.4f}, std={esm_cond.std():.4f}")
         self._debug_print(f"  H_0 (target) stats: mean={Zh.mean():.4f}, std={Zh.std():.4f}")
         
-        # Add esm_cond to cond_embedding
+        # Add esm_cond (derived from supervised rep) to cond_embedding
         cond_embedding = self._add_to_cond_embedding(
             esm_cond, cond_embedding, generate_mask, lengths
         )
         
-        # Compute auxiliary loss (chained: supervises both projections)
+        # Compute auxiliary loss (supervises esm_h0_pred directly)
+        # Gradients flow: aux_loss → esm_h0_proj → ESM
+        # And: aux_loss → esm_h0_pred → esm_h0_to_cond → cond_embedding
         aux_loss = self._compute_aux_loss(esm_h0_pred, Zh, generate_mask, lengths, L_esm)
         
         self._debug_print(f"  🎯 ESM AUX LOSS: {aux_loss.item():.4f}")
@@ -199,10 +207,13 @@ class ESMConditioner(BaseConditioner):
         **kwargs,
     ) -> torch.Tensor:
         """Apply ESM conditioning during sampling."""
-        # Project to cond_embedding space
-        proj_dtype = next(self.esm_cond_proj.parameters()).dtype
+        # Step 1: ESM → esm_h0_pred (supervised representation)
+        proj_dtype = next(self.esm_h0_proj.parameters()).dtype
         embeddings = embeddings.to(dtype=proj_dtype)
-        esm_cond = self.esm_cond_proj(embeddings)
+        esm_h0_pred = self.esm_h0_proj(embeddings)  # [B, L, latent_size]
+        
+        # Step 2: esm_h0_pred → conditioning (from supervised rep)
+        esm_cond = self.esm_h0_to_cond(esm_h0_pred)  # [B, L, hidden_size]
         
         # Add to cond_embedding
         return self._add_to_cond_embedding(
