@@ -42,16 +42,21 @@ def extract_seq_from_structure(S: torch.Tensor, generate_mask: torch.Tensor) -> 
     """
     Extract amino acid sequence from structural data at CDR positions.
     
-    This is more reliable than using ref_seq metadata, which may be corrupted.
+    This is more reliable than using ref_seq metadata, which may contain
+    structural gap markers (e.g., 'f323f295f274f214').
+    
     Uses the VOCAB to convert block type indices back to amino acid letters.
+    Only includes standard amino acids (skips gaps, fragments, unknowns).
     
     Args:
         S: Block types tensor [Nblock]
         generate_mask: CDR mask [Nblock], 1 for CDR positions
         
     Returns:
-        Amino acid sequence string for CDR positions
+        Amino acid sequence string for CDR positions (gaps filtered out)
     """
+    STANDARD_AAS = set("ACDEFGHIKLMNPQRSTVWY")
+    
     cdr_indices = generate_mask.nonzero(as_tuple=True)[0]
     if len(cdr_indices) == 0:
         return ""
@@ -63,10 +68,32 @@ def extract_seq_from_structure(S: torch.Tensor, generate_mask: torch.Tensor) -> 
         aa_abrv = VOCAB.idx_to_abrv(block_type)
         # Convert 3-letter to 1-letter code
         aa_symbol = VOCAB.abrv_to_symbol(aa_abrv)
-        if aa_symbol and len(aa_symbol) == 1:
+        # Only include standard amino acids (skip X, UNK, fragments, gaps)
+        if aa_symbol and len(aa_symbol) == 1 and aa_symbol.upper() in STANDARD_AAS:
             seq_chars.append(aa_symbol)
     
     return "".join(seq_chars)
+
+
+def clean_sequence_with_gaps(ref_seq: str) -> str:
+    """
+    Clean a sequence that may contain structural gap markers.
+    
+    Gap markers look like: 'f323f295f274f214' (fragment IDs)
+    Example input: 'EGPRATGYS5f274f214ADVFDI'
+    Example output: 'EGPRATGYSADVFDI' (gaps removed, segments concatenated)
+    
+    Args:
+        ref_seq: Raw sequence that may contain gap markers
+        
+    Returns:
+        Cleaned sequence with only standard amino acids
+    """
+    if not ref_seq:
+        return ""
+    
+    STANDARD_AAS = set("ACDEFGHIKLMNPQRSTVWY")
+    return "".join(c for c in ref_seq if c.upper() in STANDARD_AAS)
 
 
 '''
@@ -348,35 +375,27 @@ class BaseDataset(MMAPDataset):
             # So to override QKV content, we override raw_text['thinking']
             if self.use_gt_seq:
                 # Use ground truth CDR sequence for conditioning
-                # IMPORTANT: Extract sequence from STRUCTURE data (S tensor), not ref_seq metadata
-                # This avoids corruption issues in ref_seq (e.g., '5f274f214NSLRAEDTAV')
+                # Priority 1: Extract from STRUCTURE data (S tensor) - most reliable
                 struct_seq = extract_seq_from_structure(data['S'], data['generate_mask'])
                 
-                # Validate the extracted sequence
-                valid_aas = set("ACDEFGHIKLMNPQRSTVWY")
-                if struct_seq and all(aa.upper() in valid_aas for aa in struct_seq):
+                if struct_seq:
                     ref_seq = struct_seq
                 else:
-                    # Fallback to metadata ref_seq if structure extraction fails
-                    ref_seq = summary.ref_seq
-                    if ref_seq and not all(aa.upper() in valid_aas for aa in ref_seq):
-                        # Try to clean corrupted sequences
-                        clean_start = 0
-                        for i, c in enumerate(ref_seq):
-                            if c.upper() in valid_aas:
-                                clean_start = i
-                                break
-                        cleaned_seq = ref_seq[clean_start:]
-                        if cleaned_seq and all(aa.upper() in valid_aas for aa in cleaned_seq):
-                            _log_invalid_seq(summary.id, ref_seq, cleaned_seq, "cleaned_prefix")
-                            ref_seq = cleaned_seq
-                        else:
-                            _log_invalid_seq(summary.id, summary.ref_seq, None, "uncorrectable")
-                            ref_seq = None
+                    # Priority 2: Clean the metadata ref_seq (may contain gap markers)
+                    # Gap markers look like: 'f323f295f274f214' (fragment IDs in structural gaps)
+                    # Example: 'EGPRATGYS5f274f214ADVFDI' -> 'EGPRATGYSADVFDI'
+                    ref_seq = clean_sequence_with_gaps(summary.ref_seq)
+                    
+                    if ref_seq != summary.ref_seq:
+                        # Log if we had to clean the sequence
+                        _log_invalid_seq(summary.id, summary.ref_seq, ref_seq, "gap_markers_removed")
                 
-                # Always set these keys (even if None) so collate_fn doesn't get KeyError
+                if not ref_seq:
+                    _log_invalid_seq(summary.id, summary.ref_seq, None, "no_valid_sequence")
+                
+                # Always set these keys (even if empty) so collate_fn doesn't get KeyError
                 data['response_qkv_text'] = ref_seq if ref_seq else ""
-                data['gt_seq_for_injection'] = ref_seq  # None if invalid, will be filtered later
+                data['gt_seq_for_injection'] = ref_seq if ref_seq else None
                 if data.get('raw_text'):
                     data['raw_text'] = dict(data['raw_text'])  # Make a copy to avoid mutating cache
                     data['raw_text']['thinking'] = ref_seq if ref_seq else ""  # Use clean sequence
