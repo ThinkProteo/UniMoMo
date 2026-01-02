@@ -37,6 +37,38 @@ from .bioparse.utils import recur_index, index_to_numerical_index, is_aa
 from .mmap_dataset import MMAPDataset
 from .utils import load_prompt_jsonl, load_prompt_jsonl_extended, load_prompt_jsonl_extended_dual
 
+
+def extract_seq_from_structure(S: torch.Tensor, generate_mask: torch.Tensor) -> str:
+    """
+    Extract amino acid sequence from structural data at CDR positions.
+    
+    This is more reliable than using ref_seq metadata, which may be corrupted.
+    Uses the VOCAB to convert block type indices back to amino acid letters.
+    
+    Args:
+        S: Block types tensor [Nblock]
+        generate_mask: CDR mask [Nblock], 1 for CDR positions
+        
+    Returns:
+        Amino acid sequence string for CDR positions
+    """
+    cdr_indices = generate_mask.nonzero(as_tuple=True)[0]
+    if len(cdr_indices) == 0:
+        return ""
+    
+    seq_chars = []
+    for idx in cdr_indices:
+        block_type = S[idx].item()
+        # Convert block type index to amino acid abbreviation
+        aa_abrv = VOCAB.idx_to_abrv(block_type)
+        # Convert 3-letter to 1-letter code
+        aa_symbol = VOCAB.abrv_to_symbol(aa_abrv)
+        if aa_symbol and len(aa_symbol) == 1:
+            seq_chars.append(aa_symbol)
+    
+    return "".join(seq_chars)
+
+
 '''
 Base class
 '''
@@ -315,36 +347,39 @@ class BaseDataset(MMAPDataset):
             # QKV extraction happens on tokens within <think>...</think>
             # So to override QKV content, we override raw_text['thinking']
             if self.use_gt_seq:
-                # DEBUG: Use ground truth CDR sequence for QKV conditioning
-                # Store raw GT sequence - text_injection_mode will tokenize per-residue
-                # Validate that ref_seq is an actual amino acid sequence
-                valid_aas = set("ACDEFGHIKLMNPQRSTVWY")
-                ref_seq = summary.ref_seq
+                # Use ground truth CDR sequence for conditioning
+                # IMPORTANT: Extract sequence from STRUCTURE data (S tensor), not ref_seq metadata
+                # This avoids corruption issues in ref_seq (e.g., '5f274f214NSLRAEDTAV')
+                struct_seq = extract_seq_from_structure(data['S'], data['generate_mask'])
                 
-                # Try to clean corrupted sequences (e.g., '5f274f214NSLRAEDTAV' -> 'NSLRAEDTAV')
-                if ref_seq and not all(aa.upper() in valid_aas for aa in ref_seq):
-                    # Find where valid AA sequence starts
-                    clean_start = 0
-                    for i, c in enumerate(ref_seq):
-                        if c.upper() in valid_aas:
-                            clean_start = i
-                            break
-                    cleaned_seq = ref_seq[clean_start:]
-                    if cleaned_seq and all(aa.upper() in valid_aas for aa in cleaned_seq):
-                        print(f"⚠️ Cleaned corrupted ref_seq for {summary.id}: '{ref_seq}' -> '{cleaned_seq}'")
-                        _log_invalid_seq(summary.id, ref_seq, cleaned_seq, "cleaned_prefix")
-                        ref_seq = cleaned_seq
-                    else:
-                        print(f"⚠️ Skipping invalid ref_seq for {summary.id}: '{summary.ref_seq}'")
-                        _log_invalid_seq(summary.id, summary.ref_seq, None, "uncorrectable")
-                        ref_seq = None
+                # Validate the extracted sequence
+                valid_aas = set("ACDEFGHIKLMNPQRSTVWY")
+                if struct_seq and all(aa.upper() in valid_aas for aa in struct_seq):
+                    ref_seq = struct_seq
+                else:
+                    # Fallback to metadata ref_seq if structure extraction fails
+                    ref_seq = summary.ref_seq
+                    if ref_seq and not all(aa.upper() in valid_aas for aa in ref_seq):
+                        # Try to clean corrupted sequences
+                        clean_start = 0
+                        for i, c in enumerate(ref_seq):
+                            if c.upper() in valid_aas:
+                                clean_start = i
+                                break
+                        cleaned_seq = ref_seq[clean_start:]
+                        if cleaned_seq and all(aa.upper() in valid_aas for aa in cleaned_seq):
+                            _log_invalid_seq(summary.id, ref_seq, cleaned_seq, "cleaned_prefix")
+                            ref_seq = cleaned_seq
+                        else:
+                            _log_invalid_seq(summary.id, summary.ref_seq, None, "uncorrectable")
+                            ref_seq = None
                 
                 # Always set these keys (even if None) so collate_fn doesn't get KeyError
                 data['response_qkv_text'] = ref_seq if ref_seq else ""
                 data['gt_seq_for_injection'] = ref_seq  # None if invalid, will be filtered later
                 if data.get('raw_text'):
                     data['raw_text'] = dict(data['raw_text'])  # Make a copy to avoid mutating cache
-                    data['raw_text']['thinking'] = summary.ref_seq  # GT seq becomes thinking content
+                    data['raw_text']['thinking'] = ref_seq if ref_seq else ""  # Use clean sequence
                     data['raw_text']['question'] = ""  # No prompt - QKV tokens are standalone
             elif self.use_answer_only_qkv:
                 # DEBUG: Use answer text for QKV conditioning
