@@ -2,8 +2,34 @@
 # -*- coding:utf-8 -*-
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass
+import os
+from pathlib import Path
+from datetime import datetime
 
 import torch
+
+# Global log file for invalid ref_seq samples
+_INVALID_SEQ_LOG_FILE = None
+
+def _log_invalid_seq(sample_id: str, original_seq: str, cleaned_seq: str = None, reason: str = ""):
+    """Log invalid ref_seq samples to a file in the logs directory."""
+    global _INVALID_SEQ_LOG_FILE
+    
+    if _INVALID_SEQ_LOG_FILE is None:
+        # Create logs directory if it doesn't exist
+        logs_dir = Path("./logs")
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _INVALID_SEQ_LOG_FILE = logs_dir / f"invalid_ref_seq_{timestamp}.log"
+        # Write header
+        with open(_INVALID_SEQ_LOG_FILE, 'w') as f:
+            f.write("# Invalid ref_seq samples log\n")
+            f.write(f"# Created: {datetime.now().isoformat()}\n")
+            f.write("# Format: sample_id | original_seq | cleaned_seq | reason\n")
+            f.write("="*80 + "\n")
+    
+    with open(_INVALID_SEQ_LOG_FILE, 'a') as f:
+        f.write(f"{sample_id} | {original_seq} | {cleaned_seq or 'N/A'} | {reason}\n")
 
 from .bioparse import Block, Complex, VOCAB, const
 from .bioparse.utils import recur_index, index_to_numerical_index, is_aa
@@ -306,9 +332,11 @@ class BaseDataset(MMAPDataset):
                     cleaned_seq = ref_seq[clean_start:]
                     if cleaned_seq and all(aa.upper() in valid_aas for aa in cleaned_seq):
                         print(f"⚠️ Cleaned corrupted ref_seq for {summary.id}: '{ref_seq}' -> '{cleaned_seq}'")
+                        _log_invalid_seq(summary.id, ref_seq, cleaned_seq, "cleaned_prefix")
                         ref_seq = cleaned_seq
                     else:
                         print(f"⚠️ Skipping invalid ref_seq for {summary.id}: '{summary.ref_seq}'")
+                        _log_invalid_seq(summary.id, summary.ref_seq, None, "uncorrectable")
                         ref_seq = None
                 
                 # Always set these keys (even if None) so collate_fn doesn't get KeyError
