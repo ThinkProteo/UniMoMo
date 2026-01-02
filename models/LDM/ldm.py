@@ -332,9 +332,11 @@ class LDMMolDesign(nn.Module):
             loss_dict['aux_loss'] = aux_loss
             loss_dict['total'] = loss_dict['total'] + self.aux_loss_weight * aux_loss
 
-        # Log conditioner scale
+        # Log conditioner scale (both generic 'text_scale' and specific name for wandb)
         if self.conditioner is not None and hasattr(self.conditioner, 'scale'):
-            loss_dict[f'{self.conditioner.name}_scale'] = self.conditioner.scale.detach()
+            scale_val = self.conditioner.scale.detach()
+            loss_dict['text_scale'] = scale_val  # For backward compatibility with training script
+            loss_dict[f'{self.conditioner.name}_scale'] = scale_val  # Specific name
 
         return loss_dict
 
