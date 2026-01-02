@@ -757,21 +757,19 @@ class LDMMolDesign(nn.Module):
         
         # ESM EMBEDDING MODE: Use ESM for sampling
         # KEY: Use esm_h0_proj prediction as H_prior for diffusion initialization
-        # This connects the trained esm_h0_proj directly to the diffusion output!
-        H_prior = None
+        # ESM conditioning: add esm_cond to cond_embedding (structural context)
+        # Note: aux_loss trains esm_h0_proj but we don't use H_prior at inference
+        # to maintain train-test consistency (training always starts from random noise)
         if self.use_esm_embed and esm_embeddings is not None:
             batch_size = lengths.shape[0]
             B, L_esm, esm_dim = esm_embeddings.shape
             
-            # CHAINED projection: ESM → esm_cond → esm_h0_pred
+            # Project ESM to conditioning space
             proj_dtype = next(self.esm_cond_proj.parameters()).dtype
             esm_embeddings = esm_embeddings.to(dtype=proj_dtype)
             esm_cond = self.esm_cond_proj(esm_embeddings)   # [B, L_esm, hidden_size]
-            esm_h0_pred = self.esm_h0_proj(esm_cond)        # [B, L_esm, latent_size] - trained to predict H_0!
             
-            # Initialize H_prior with zeros, then fill with ESM predictions at CDR positions
-            H_prior = torch.zeros_like(Zh)
-            
+            # Add ESM conditioning to cond_embedding at CDR positions
             offset = 0
             for sample_idx in range(batch_size):
                 sample_len = int(lengths[sample_idx].item())
@@ -786,10 +784,6 @@ class LDMMolDesign(nn.Module):
                     # Add ESM to cond_embedding
                     esm_embed = esm_cond[sample_idx, :n_to_add]
                     cond_embedding[global_positions] = cond_embedding[global_positions] + self.esm_scale * esm_embed
-                    
-                    # Set H_prior at CDR positions with esm_h0_pred
-                    h0_pred = esm_h0_pred[sample_idx, :n_to_add]
-                    H_prior[global_positions] = h0_pred
                 
                 offset += sample_len
             
@@ -807,7 +801,6 @@ class LDMMolDesign(nn.Module):
             text_v=text_v,
             mask_text=mask_text,
             text_lengths=text_lengths,
-            H_prior=H_prior,  # Use ESM prediction as initialization prior
             **sample_opt
         )
         X_0, H_0 = traj[0]

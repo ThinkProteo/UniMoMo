@@ -281,7 +281,6 @@ class FullDPM(nn.Module):
             text_v=None,    # Optional: text value features for conditioning
             mask_text=None, # Optional: text attention mask
             text_lengths=None,  # Optional: [B] actual text lengths for RoPE
-            H_prior=None,   # Optional: [N, latent_dim] prior for H initialization (e.g., from ESM)
         ):
         
         # Use instance configuration if not overridden
@@ -290,19 +289,12 @@ class FullDPM(nn.Module):
 
         batch_ids = length_to_batch_id(lengths)
 
-        # Random initialization for X
+        # Random initialization for X and H (standard diffusion)
         X_rand = torch.randn_like(X)
         X_init = torch.where(generate_mask[:, None].expand_as(X), X_rand, X)
         
-        # Initialization for H: use H_prior if provided, otherwise random
-        if H_prior is not None:
-            # Use the provided prior (e.g., from esm_h0_proj) as initialization
-            # Add small noise for diffusion to work with
-            H_init = H_prior + 0.1 * torch.randn_like(H_prior)
-            H_init = torch.where(generate_mask[:, None].expand_as(H), H_init, H)
-        else:
-            H_rand = torch.randn_like(H)
-            H_init = torch.where(generate_mask[:, None].expand_as(H), H_rand, H)
+        H_rand = torch.randn_like(H)
+        H_init = torch.where(generate_mask[:, None].expand_as(H), H_rand, H)
 
         traj = {self.num_steps: (X_init, H_init)}
         if pbar:
