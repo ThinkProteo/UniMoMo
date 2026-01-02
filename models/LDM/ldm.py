@@ -184,6 +184,52 @@ class LDMMolDesign(nn.Module):
                 self.conditioner.scale.fill_(value)
             print(f"📌 Reset conditioner scale to {value}")
 
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        Load state dict with backward compatibility for old checkpoints.
+        
+        Old checkpoints have weights like:
+            esm_cond_proj.0.weight, esm_h0_proj.0.weight, esm_scale
+            aa_embed.weight, aa_pos_embed.weight, aa_scale
+            text_proj.0.weight, text_h0_proj.weight, text_scale
+            
+        New code expects:
+            conditioner.esm_cond_proj.0.weight, conditioner.scale, etc.
+        """
+        # Map old weight names to new names
+        remapped_state_dict = {}
+        conditioner_prefixes = [
+            # ESM conditioner
+            ('esm_cond_proj.', 'conditioner.esm_cond_proj.'),
+            ('esm_h0_proj.', 'conditioner.esm_h0_proj.'),
+            ('esm_scale', 'conditioner.scale'),
+            # Learned AA conditioner  
+            ('aa_embed.', 'conditioner.aa_embed.'),
+            ('aa_pos_embed.', 'conditioner.aa_pos_embed.'),
+            ('aa_cond_proj.', 'conditioner.aa_cond_proj.'),
+            ('aa_scale', 'conditioner.scale'),
+            # Qwen text conditioner
+            ('text_proj.', 'conditioner.text_proj.'),
+            ('text_h0_proj.', 'conditioner.text_h0_proj.'),
+            ('text_scale', 'conditioner.scale'),
+        ]
+        
+        remapped_count = 0
+        for key, value in state_dict.items():
+            new_key = key
+            for old_prefix, new_prefix in conditioner_prefixes:
+                if key == old_prefix or key.startswith(old_prefix):
+                    new_key = key.replace(old_prefix, new_prefix, 1)
+                    if new_key != key:
+                        remapped_count += 1
+                    break
+            remapped_state_dict[new_key] = value
+        
+        if remapped_count > 0:
+            print(f"📌 Loaded old checkpoint: remapped {remapped_count} conditioner weights to new format")
+        
+        return super().load_state_dict(remapped_state_dict, strict=strict)
+
     # ========== FORWARD PASS ==========
     @oom_decorator
     def forward(
