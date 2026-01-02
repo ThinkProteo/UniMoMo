@@ -64,6 +64,8 @@ class LDMMolDesign(nn.Module):
             use_learned_aa_embed=False,
             use_esm_embed=False,
             esm_model_name="esm2_t33_650M_UR50D",
+            # Auxiliary loss weight (0 to disable)
+            aux_loss_weight=1.0,
             # Debug options
             debug_conditioning=True,
         ):
@@ -96,6 +98,7 @@ class LDMMolDesign(nn.Module):
             esm_model_name=esm_model_name,
             hidden_size=hidden_size,
             latent_size=latent_size,
+            aux_loss_weight=aux_loss_weight,
             debug=debug_conditioning,
         )
 
@@ -140,6 +143,7 @@ class LDMMolDesign(nn.Module):
         esm_model_name: str,
         hidden_size: int,
         latent_size: int,
+        aux_loss_weight: float,
         debug: bool,
     ):
         """Setup the appropriate conditioner based on config."""
@@ -148,6 +152,7 @@ class LDMMolDesign(nn.Module):
                 hidden_size=hidden_size,
                 latent_size=latent_size,
                 esm_model_name=esm_model_name,
+                aux_loss_weight=aux_loss_weight,
                 debug=debug,
             )
             # Store reference for ESM extraction convenience
@@ -156,6 +161,7 @@ class LDMMolDesign(nn.Module):
             self.conditioner = LearnedAAConditioner(
                 hidden_size=hidden_size,
                 latent_size=latent_size,
+                aux_loss_weight=aux_loss_weight,
                 debug=debug,
             )
         elif text_injection_mode:
@@ -163,6 +169,7 @@ class LDMMolDesign(nn.Module):
                 hidden_size=hidden_size,
                 latent_size=latent_size,
                 text_embed_dim=text_embed_dim,
+                aux_loss_weight=aux_loss_weight,
                 debug=debug,
             )
         else:
