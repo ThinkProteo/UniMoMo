@@ -311,9 +311,9 @@ class BaseDataset(MMAPDataset):
                         print(f"⚠️ Skipping invalid ref_seq for {summary.id}: '{summary.ref_seq}'")
                         ref_seq = None
                 
-                if ref_seq:
-                    data['response_qkv_text'] = ref_seq
-                    data['gt_seq_for_injection'] = ref_seq  # Raw sequence for per-residue tokenization
+                # Always set these keys (even if None) so collate_fn doesn't get KeyError
+                data['response_qkv_text'] = ref_seq if ref_seq else ""
+                data['gt_seq_for_injection'] = ref_seq  # None if invalid, will be filtered later
                 if data.get('raw_text'):
                     data['raw_text'] = dict(data['raw_text'])  # Make a copy to avoid mutating cache
                     data['raw_text']['thinking'] = summary.ref_seq  # GT seq becomes thinking content
