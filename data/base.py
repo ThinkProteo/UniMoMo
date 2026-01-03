@@ -79,21 +79,31 @@ def clean_sequence_with_gaps(ref_seq: str) -> str:
     """
     Clean a sequence that may contain structural gap markers.
     
-    Gap markers look like: 'f323f295f274f214' (fragment IDs)
-    Example input: 'EGPRATGYS5f274f214ADVFDI'
-    Example output: 'EGPRATGYSADVFDI' (gaps removed, segments concatenated)
+    Gap markers are encoded as 'f' followed by exactly 3 digits (Quantized Geometric Tokens).
+    Each gap position is replaced with 'X' (unknown amino acid) to preserve sequence length
+    and alignment with structure.
+    
+    Example input: 'EGPRATGYSf274f214ADVFDI'
+    Example output: 'EGPRATGYSXXADVFDI' (each gap marker replaced with X)
     
     Args:
         ref_seq: Raw sequence that may contain gap markers
         
     Returns:
-        Cleaned sequence with only standard amino acids
+        Cleaned sequence with gaps replaced by X and only valid amino acids
     """
+    import re
+    
     if not ref_seq:
         return ""
     
-    STANDARD_AAS = set("ACDEFGHIKLMNPQRSTVWY")
-    return "".join(c for c in ref_seq if c.upper() in STANDARD_AAS)
+    # Replace each gap marker (f followed by exactly 3 digits) with X
+    # Pattern: f\d{3} matches 'f' followed by exactly 3 digits
+    cleaned = re.sub(r'f\d{3}', 'X', ref_seq)
+    
+    # Now filter to only keep valid amino acids (including X for unknown)
+    VALID_AAS = set("ACDEFGHIKLMNPQRSTVWYX")
+    return "".join(c for c in cleaned if c.upper() in VALID_AAS)
 
 
 '''
