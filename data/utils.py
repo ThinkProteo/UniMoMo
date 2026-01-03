@@ -116,7 +116,7 @@ def load_prompt_jsonl_extended_dual(
     prevent_leakage_qkv_only: bool = False,
     leakage_marker: str = '**Foldability:**',
     use_answer_only_qkv: bool = False
-) -> tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+) -> tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, dict], Dict[str, str]]:
     """
     Load extended JSONL with TWO response versions for separate QKV and SFT processing.
 
@@ -136,20 +136,23 @@ def load_prompt_jsonl_extended_dual(
                             This is a DEBUG mode to test if diffusion can learn from ground truth answer only.
 
     Returns:
-        (prompt_map, response_qkv_map, response_sft_map): Three dicts mapping sample_id -> text
+        (prompt_map, response_qkv_map, response_sft_map, raw_text_map, answer_sequence_map): Five dicts mapping sample_id -> text
             - prompt_map: Question text
             - response_qkv_map: Thinking truncated at marker (for QKV extraction), or answer-only if use_answer_only_qkv
             - response_sft_map: Full thinking + answer (for SFT loss)
+            - raw_text_map: Full JSONL record (for accessing all fields)
+            - answer_sequence_map: CDR sequence extracted from answer (cleaner than ref_seq)
             
         If prevent_leakage_qkv_only=False, response_qkv_map == response_sft_map (backward compatible)
     """
     prompt_map: Dict[str, str] = {}
     response_qkv_map: Dict[str, str] = {}
     response_sft_map: Dict[str, str] = {}
-    raw_text_map: Dict[str, str] = {}
+    raw_text_map: Dict[str, dict] = {}
+    answer_sequence_map: Dict[str, str] = {}
 
     if path is None:
-        return prompt_map, response_qkv_map, response_sft_map
+        return prompt_map, response_qkv_map, response_sft_map, raw_text_map, answer_sequence_map
 
     with open(path, 'r') as fin:
         for line in fin:
@@ -172,6 +175,12 @@ def load_prompt_jsonl_extended_dual(
             # Extract thinking and answer
             _thinking = record.get(thinking_key, "")
             _answer = record.get(response_key, "")
+
+            # Extract answer_sequence (clean CDR sequence from JSONL)
+            _answer_sequence = record.get('answer_sequence', "")
+            if _answer_sequence:
+                answer_sequence_map[_id] = _answer_sequence
+                answer_sequence_map[_id.lower()] = _answer_sequence
 
             if prevent_leakage_qkv_only:
                 # NEW MODE: Dual response versions
@@ -221,5 +230,5 @@ def load_prompt_jsonl_extended_dual(
                     response_sft_map[_id] = combined_response
                     response_sft_map[_id.lower()] = combined_response
 
-    return prompt_map, response_qkv_map, response_sft_map, raw_text_map
+    return prompt_map, response_qkv_map, response_sft_map, raw_text_map, answer_sequence_map
 

@@ -178,6 +178,7 @@ class BaseDataset(MMAPDataset):
             use_answer_only_qkv: Optional[bool] = False,
             use_gt_seq: Optional[bool] = False,
             gt_seq_mask_ratio: Optional[float] = 0.0,
+            use_answer_sequence: Optional[bool] = False,
         ) -> None:
         super().__init__(mmap_dir, specify_data, specify_index)
         self.mmap_dir = mmap_dir
@@ -188,12 +189,13 @@ class BaseDataset(MMAPDataset):
         self.use_answer_only_qkv = use_answer_only_qkv
         self.use_gt_seq = use_gt_seq
         self.gt_seq_mask_ratio = gt_seq_mask_ratio  # Randomly mask this fraction of residues with X
+        self.use_answer_sequence = use_answer_sequence  # Use answer_sequence from JSONL instead of ref_seq
 
         # Load prompt data based on format
         if prompt_jsonl:
             if prevent_leakage_qkv_only: # only support this for now!
                 # NEW: Dual response mode (different text for QKV vs SFT)
-                self._prompt_map, self._response_qkv_map, self._response_sft_map, self._raw_text_map = load_prompt_jsonl_extended_dual(
+                self._prompt_map, self._response_qkv_map, self._response_sft_map, self._raw_text_map, self._answer_sequence_map = load_prompt_jsonl_extended_dual(
                     prompt_jsonl,
                     prevent_leakage_qkv_only=True,
                     leakage_marker=leakage_marker,
@@ -206,6 +208,7 @@ class BaseDataset(MMAPDataset):
             self._response_map = None
             self._response_qkv_map = None
             self._response_sft_map = None
+            self._answer_sequence_map = None
 
         # default non-strict to avoid hard failures on missing ids
         self.strict_prompt = False if strict_prompt is None else strict_prompt
@@ -281,6 +284,10 @@ class BaseDataset(MMAPDataset):
 
     def _find_raw_text(self, sample_id: str):
         return self._find(self._raw_text_map, sample_id)
+
+    def _find_answer_sequence(self, sample_id: str):
+        """Find answer_sequence (clean CDR sequence from JSONL) for a sample ID."""
+        return self._find(self._answer_sequence_map, sample_id)
 
     def _filter_samples_by_prompt_availability(self):
         """
@@ -425,7 +432,29 @@ class BaseDataset(MMAPDataset):
             # NOTE: The collate_fn uses raw_text['thinking'] to build <think>...</think>
             # QKV extraction happens on tokens within <think>...</think>
             # So to override QKV content, we override raw_text['thinking']
-            if self.use_gt_seq:
+            if self.use_answer_sequence:
+                # Use answer_sequence from JSONL for conditioning
+                # This is cleaner than ref_seq - already extracted CDR sequence without gap markers
+                answer_seq = self._find_answer_sequence(summary.id)
+                
+                if not answer_seq:
+                    # Fallback to structure-based extraction
+                    answer_seq = extract_seq_from_structure(data['S'], data['generate_mask'])
+                    if not answer_seq:
+                        _log_invalid_seq(summary.id, "", None, "no_answer_sequence_in_jsonl")
+                
+                # Apply random masking if configured
+                if answer_seq and self.gt_seq_mask_ratio > 0.0:
+                    answer_seq = mask_sequence_randomly(answer_seq, self.gt_seq_mask_ratio)
+                
+                # Set data for downstream use
+                data['response_qkv_text'] = answer_seq if answer_seq else ""
+                data['gt_seq_for_injection'] = answer_seq if answer_seq else None
+                if data.get('raw_text'):
+                    data['raw_text'] = dict(data['raw_text'])  # Make a copy to avoid mutating cache
+                    data['raw_text']['thinking'] = answer_seq if answer_seq else ""
+                    data['raw_text']['question'] = ""  # No prompt - QKV tokens are standalone
+            elif self.use_gt_seq:
                 # Use ground truth CDR sequence for conditioning
                 # Priority 1: Extract from STRUCTURE data (S tensor) - most reliable
                 struct_seq = extract_seq_from_structure(data['S'], data['generate_mask'])
