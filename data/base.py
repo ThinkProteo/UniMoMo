@@ -106,6 +106,46 @@ def clean_sequence_with_gaps(ref_seq: str) -> str:
     return "".join(c for c in cleaned if c.upper() in VALID_AAS)
 
 
+def mask_sequence_randomly(seq: str, mask_ratio: float) -> str:
+    """
+    Randomly mask a percentage of residues in a sequence with 'X'.
+    
+    This is useful for training robustness - the model learns to work with
+    partial sequence information.
+    
+    Args:
+        seq: Input amino acid sequence
+        mask_ratio: Fraction of residues to mask (0.0 to 1.0)
+        
+    Returns:
+        Sequence with randomly selected residues replaced with 'X'
+        
+    Example:
+        mask_sequence_randomly("EGPR", 0.5) might return "EXRX" or "XGPX" etc.
+    """
+    import random
+    
+    if not seq or mask_ratio <= 0.0:
+        return seq
+    
+    if mask_ratio >= 1.0:
+        return "X" * len(seq)
+    
+    seq_list = list(seq)
+    n_to_mask = int(len(seq) * mask_ratio)
+    
+    # Randomly select positions to mask (excluding already masked X positions)
+    maskable_indices = [i for i, c in enumerate(seq_list) if c.upper() != 'X']
+    
+    if n_to_mask > 0 and maskable_indices:
+        n_to_mask = min(n_to_mask, len(maskable_indices))
+        mask_indices = random.sample(maskable_indices, n_to_mask)
+        for idx in mask_indices:
+            seq_list[idx] = 'X'
+    
+    return "".join(seq_list)
+
+
 '''
 Base class
 '''
@@ -137,6 +177,7 @@ class BaseDataset(MMAPDataset):
             leakage_marker: Optional[str] = '**Foldability:**',
             use_answer_only_qkv: Optional[bool] = False,
             use_gt_seq: Optional[bool] = False,
+            gt_seq_mask_ratio: Optional[float] = 0.0,
         ) -> None:
         super().__init__(mmap_dir, specify_data, specify_index)
         self.mmap_dir = mmap_dir
@@ -146,6 +187,7 @@ class BaseDataset(MMAPDataset):
         self.leakage_marker = leakage_marker
         self.use_answer_only_qkv = use_answer_only_qkv
         self.use_gt_seq = use_gt_seq
+        self.gt_seq_mask_ratio = gt_seq_mask_ratio  # Randomly mask this fraction of residues with X
 
         # Load prompt data based on format
         if prompt_jsonl:
@@ -393,15 +435,20 @@ class BaseDataset(MMAPDataset):
                 else:
                     # Priority 2: Clean the metadata ref_seq (may contain gap markers)
                     # Gap markers look like: 'f323f295f274f214' (fragment IDs in structural gaps)
-                    # Example: 'EGPRATGYS5f274f214ADVFDI' -> 'EGPRATGYSADVFDI'
+                    # Example: 'EGPRATGYSf274f214ADVFDI' -> 'EGPRATGYSXXADVFDI'
                     ref_seq = clean_sequence_with_gaps(summary.ref_seq)
                     
                     if ref_seq != summary.ref_seq:
                         # Log if we had to clean the sequence
-                        _log_invalid_seq(summary.id, summary.ref_seq, ref_seq, "gap_markers_removed")
+                        _log_invalid_seq(summary.id, summary.ref_seq, ref_seq, "gap_markers_replaced")
                 
                 if not ref_seq:
                     _log_invalid_seq(summary.id, summary.ref_seq, None, "no_valid_sequence")
+                
+                # Apply random masking if configured
+                # This randomly replaces a fraction of residues with 'X' for training robustness
+                if ref_seq and self.gt_seq_mask_ratio > 0.0:
+                    ref_seq = mask_sequence_randomly(ref_seq, self.gt_seq_mask_ratio)
                 
                 # Always set these keys (even if empty) so collate_fn doesn't get KeyError
                 data['response_qkv_text'] = ref_seq if ref_seq else ""
