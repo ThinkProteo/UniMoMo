@@ -65,6 +65,7 @@ class LDMMolDesign(nn.Module):
             use_esm_embed=False,
             esm_model_name="esm2_t33_650M_UR50D",
             use_answer_seq_und=False,  # Use answer_sequence hidden states from Qwen
+            no_context_attention=False,  # ABLATION: answer_seq tokens don't attend to context
             # Auxiliary loss weight (0 to disable)
             aux_loss_weight=1.0,
             # Debug options
@@ -76,6 +77,7 @@ class LDMMolDesign(nn.Module):
         self.use_learned_aa_embed = use_learned_aa_embed
         self.use_esm_embed = use_esm_embed
         self.use_answer_seq_und = use_answer_seq_und
+        self.no_context_attention = no_context_attention
 
         # Load frozen VAE
         self.autoencoder: CondIterAutoEncoder = torch.load(
