@@ -36,7 +36,7 @@ from ..IterVAE.model import CondIterAutoEncoder
 from ..modules.nn import GINEConv, MLP
 
 # Import conditioners
-from .conditioners import QwenTextConditioner, LearnedAAConditioner, ESMConditioner
+from .conditioners import QwenTextConditioner, LearnedAAConditioner, ESMConditioner, AnswerSeqConditioner
 
 
 @R.register('LDMMolDesign')
@@ -64,6 +64,7 @@ class LDMMolDesign(nn.Module):
             use_learned_aa_embed=False,
             use_esm_embed=False,
             esm_model_name="esm2_t33_650M_UR50D",
+            use_answer_seq_und=False,  # Use answer_sequence hidden states from Qwen
             # Auxiliary loss weight (0 to disable)
             aux_loss_weight=1.0,
             # Debug options
@@ -74,6 +75,7 @@ class LDMMolDesign(nn.Module):
         self.text_injection_mode = text_injection_mode
         self.use_learned_aa_embed = use_learned_aa_embed
         self.use_esm_embed = use_esm_embed
+        self.use_answer_seq_und = use_answer_seq_und
 
         # Load frozen VAE
         self.autoencoder: CondIterAutoEncoder = torch.load(
@@ -96,6 +98,7 @@ class LDMMolDesign(nn.Module):
             use_learned_aa_embed=use_learned_aa_embed,
             use_esm_embed=use_esm_embed,
             esm_model_name=esm_model_name,
+            use_answer_seq_und=use_answer_seq_und,
             hidden_size=hidden_size,
             latent_size=latent_size,
             aux_loss_weight=aux_loss_weight,
@@ -141,6 +144,7 @@ class LDMMolDesign(nn.Module):
         use_learned_aa_embed: bool,
         use_esm_embed: bool,
         esm_model_name: str,
+        use_answer_seq_und: bool,
         hidden_size: int,
         latent_size: int,
         aux_loss_weight: float,
@@ -157,6 +161,17 @@ class LDMMolDesign(nn.Module):
             )
             # Store reference for ESM extraction convenience
             self._esm_conditioner = self.conditioner
+        elif use_answer_seq_und:
+            # Use hidden states from answer_sequence tokens in Qwen output
+            self.conditioner = AnswerSeqConditioner(
+                hidden_size=hidden_size,
+                latent_size=latent_size,
+                text_embed_dim=text_embed_dim,
+                aux_loss_weight=aux_loss_weight,
+                debug=debug,
+            )
+            print("📌 AnswerSeqConditioner: Uses hidden states from answer_sequence tokens")
+            print("   ⚠️ Text K/V attention in diffusion will be DISABLED")
         elif use_learned_aa_embed:
             self.conditioner = LearnedAAConditioner(
                 hidden_size=hidden_size,
@@ -259,6 +274,8 @@ class LDMMolDesign(nn.Module):
             text_lengths=None,
             aa_indices=None,
             esm_embeddings=None,
+            esm_valid_mask=None,  # [B, L] bool: True for non-X positions (for aux_loss)
+            answer_seq_embeddings=None,  # [B, L_seq, hidden] for use_answer_seq_und mode
             t=None,
         ):
         """
@@ -268,7 +285,11 @@ class LDMMolDesign(nn.Module):
         - ESMConditioner: uses esm_embeddings
         - LearnedAAConditioner: uses aa_indices
         - QwenTextConditioner: uses text_v
+        - AnswerSeqConditioner: uses answer_seq_embeddings (disables text K/V attention)
         - None: uses text_k, text_v for attention
+        
+        esm_valid_mask: Optional mask for non-X positions in sequences.
+            When provided, aux_loss only includes non-X (True) positions.
         """
         # Encode structure to latent space
         with torch.no_grad():
@@ -302,6 +323,7 @@ class LDMMolDesign(nn.Module):
                 esm_embeddings=esm_embeddings,
                 aa_indices=aa_indices,
                 text_v=text_v,
+                answer_seq_embeddings=answer_seq_embeddings,
             )
             if embeddings is not None:
                 cond_embedding, aux_loss = self.conditioner.forward(
@@ -312,6 +334,7 @@ class LDMMolDesign(nn.Module):
                     Zh=Zh,
                     mask_text=mask_text,
                     text_lengths=text_lengths,
+                    valid_mask=esm_valid_mask,  # Mask for non-X positions
                 )
                 # Disable attention conditioning when using conditioner
                 text_k, text_v, mask_text, text_lengths = None, None, None, None
@@ -352,10 +375,13 @@ class LDMMolDesign(nn.Module):
         esm_embeddings=None,
         aa_indices=None,
         text_v=None,
+        answer_seq_embeddings=None,
     ):
         """Get the appropriate embeddings for the current conditioner."""
         if self.use_esm_embed and esm_embeddings is not None:
             return esm_embeddings
+        elif self.use_answer_seq_und and answer_seq_embeddings is not None:
+            return answer_seq_embeddings
         elif self.use_learned_aa_embed and aa_indices is not None:
             return aa_indices
         elif self.text_injection_mode and text_v is not None:
@@ -424,6 +450,7 @@ class LDMMolDesign(nn.Module):
             text_lengths=None,
             aa_indices=None,
             esm_embeddings=None,
+            answer_seq_embeddings=None,  # [B, L_seq, hidden] for use_answer_seq_und mode
             sample_opt={},
             return_tensor=False,
         ):
@@ -464,6 +491,7 @@ class LDMMolDesign(nn.Module):
                 esm_embeddings=esm_embeddings,
                 aa_indices=aa_indices,
                 text_v=text_v,
+                answer_seq_embeddings=answer_seq_embeddings,
             )
             if embeddings is not None:
                 cond_embedding = self.conditioner.condition_sample(

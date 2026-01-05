@@ -99,6 +99,7 @@ class LearnedAAConditioner(BaseConditioner):
         generate_mask: torch.Tensor,
         lengths: torch.Tensor,
         Zh: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -110,6 +111,8 @@ class LearnedAAConditioner(BaseConditioner):
             generate_mask: CDR mask [N]
             lengths: Sample lengths [B]
             Zh: Target H_0 [N, latent_size]
+            valid_mask: [B, L] bool - True for non-X positions (optional)
+                        If provided, only non-X positions contribute to aux_loss.
         """
         aa_indices = embeddings  # [B, L_aa]
         B, L_aa = aa_indices.shape
@@ -141,7 +144,8 @@ class LearnedAAConditioner(BaseConditioner):
         )
         
         # Compute auxiliary loss (direct AA → H_0)
-        aux_loss = self._compute_aux_loss(aa_h0_pred, Zh, generate_mask, lengths, L_aa)
+        # If valid_mask provided, only non-X positions contribute to loss
+        aux_loss = self._compute_aux_loss(aa_h0_pred, Zh, generate_mask, lengths, L_aa, valid_mask)
         
         self._debug_print(f"  🎯 AA AUX LOSS: {aux_loss.item():.4f}")
         self._debug_print(f"  scale: {self.scale.item():.4f}")

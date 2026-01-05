@@ -82,6 +82,7 @@ class QwenTextConditioner(BaseConditioner):
         Zh: torch.Tensor,
         mask_text: Optional[torch.Tensor] = None,
         text_lengths: Optional[torch.Tensor] = None,
+        valid_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -95,6 +96,8 @@ class QwenTextConditioner(BaseConditioner):
             Zh: Target H_0 [N, latent_size]
             mask_text: Text attention mask [B, L]
             text_lengths: Actual text lengths [B]
+            valid_mask: [B, L] bool - True for non-X positions (optional)
+                        If provided, only non-X positions contribute to aux_loss.
         """
         # Handle different input formats
         if embeddings.dim() == 4:
@@ -126,7 +129,8 @@ class QwenTextConditioner(BaseConditioner):
         self._debug_print(f"  scale: {self.scale.item():.4f}")
         
         # Compute auxiliary loss (supervises text_h0_pred directly)
-        aux_loss = self._compute_aux_loss(text_h0_pred, Zh, generate_mask, lengths, L_text)
+        # If valid_mask provided, only non-X positions contribute to loss
+        aux_loss = self._compute_aux_loss(text_h0_pred, Zh, generate_mask, lengths, L_text, valid_mask)
         
         self._debug_print(f"  🎯 AUX LOSS: {aux_loss.item():.4f}")
         

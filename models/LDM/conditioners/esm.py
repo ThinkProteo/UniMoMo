@@ -158,6 +158,7 @@ class ESMConditioner(BaseConditioner):
         generate_mask: torch.Tensor,
         lengths: torch.Tensor,
         Zh: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -169,6 +170,8 @@ class ESMConditioner(BaseConditioner):
             generate_mask: CDR mask [N]
             lengths: Sample lengths [B]
             Zh: Target H_0 [N, latent_size]
+            valid_mask: [B, L] bool - True for non-X positions (optional)
+                        If provided, only non-X positions contribute to aux_loss.
         """
         B, L_esm, esm_dim = embeddings.shape
         
@@ -194,7 +197,8 @@ class ESMConditioner(BaseConditioner):
         # Compute auxiliary loss (supervises esm_h0_pred directly)
         # Gradients flow: aux_loss → esm_h0_proj → ESM
         # And: aux_loss → esm_h0_pred → esm_h0_to_cond → cond_embedding
-        aux_loss = self._compute_aux_loss(esm_h0_pred, Zh, generate_mask, lengths, L_esm)
+        # If valid_mask provided, only non-X positions contribute to loss
+        aux_loss = self._compute_aux_loss(esm_h0_pred, Zh, generate_mask, lengths, L_esm, valid_mask)
         
         self._debug_print(f"  🎯 ESM AUX LOSS: {aux_loss.item():.4f}")
         self._debug_print(f"  scale: {self.scale.item():.4f}")

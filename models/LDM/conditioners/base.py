@@ -167,6 +167,7 @@ class BaseConditioner(ABC, nn.Module):
         generate_mask: torch.Tensor,
         lengths: torch.Tensor,
         L_emb: int,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute auxiliary loss for direct H_0 prediction.
@@ -177,6 +178,8 @@ class BaseConditioner(ABC, nn.Module):
             generate_mask: [N] - CDR mask
             lengths: [B] - sample lengths
             L_emb: Length of embedding sequence
+            valid_mask: [B, L] bool - True for non-X positions (optional)
+                        If provided, only non-X positions contribute to loss.
             
         Returns:
             aux_loss: Scalar loss tensor
@@ -187,6 +190,8 @@ class BaseConditioner(ABC, nn.Module):
         
         aux_preds = []
         aux_targets = []
+        n_valid_total = 0
+        n_masked_total = 0
         
         offset = 0
         for sample_idx in range(batch_size):
@@ -199,14 +204,35 @@ class BaseConditioner(ABC, nn.Module):
                 cdr_positions = sample_mask.nonzero(as_tuple=True)[0][:n_to_match]
                 global_positions = offset + cdr_positions
                 
-                aux_preds.append(h0_pred[sample_idx, :n_to_match])
-                aux_targets.append(h0_target[global_positions])
+                # Get predictions and targets for this sample
+                sample_preds = h0_pred[sample_idx, :n_to_match]  # [n_to_match, latent_size]
+                sample_targets = h0_target[global_positions]     # [n_to_match, latent_size]
+                
+                # Apply valid_mask if provided (exclude X positions from loss)
+                if valid_mask is not None:
+                    sample_valid = valid_mask[sample_idx, :n_to_match]  # [n_to_match]
+                    n_valid = sample_valid.sum().item()
+                    n_masked = n_to_match - n_valid
+                    n_valid_total += n_valid
+                    n_masked_total += n_masked
+                    
+                    if n_valid > 0:
+                        # Only include non-X positions
+                        aux_preds.append(sample_preds[sample_valid])
+                        aux_targets.append(sample_targets[sample_valid])
+                else:
+                    aux_preds.append(sample_preds)
+                    aux_targets.append(sample_targets)
             
             offset += sample_len
         
         if aux_preds:
             aux_preds_cat = torch.cat(aux_preds, dim=0)
             aux_targets_cat = torch.cat(aux_targets, dim=0)
+            
+            if valid_mask is not None and self.debug:
+                print(f"  📍 aux_loss: {n_valid_total} valid positions, {n_masked_total} X positions masked")
+            
             return F.mse_loss(aux_preds_cat, aux_targets_cat)
         
         return torch.tensor(0.0, device=h0_target.device)

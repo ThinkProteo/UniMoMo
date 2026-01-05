@@ -31,6 +31,92 @@ def _log_invalid_seq(sample_id: str, original_seq: str, cleaned_seq: str = None,
     with open(_INVALID_SEQ_LOG_FILE, 'a') as f:
         f.write(f"{sample_id} | {original_seq} | {cleaned_seq or 'N/A'} | {reason}\n")
 
+
+# Debug: compare answer_sequence vs ref_seq (ground truth from structure)
+_SEQ_COMPARE_LOG_FILE = None
+_SEQ_COMPARE_COUNT = 0
+_SEQ_COMPARE_MAX_LOGS = 100  # Limit number of detailed logs
+
+def _debug_compare_sequences(sample_id: str, answer_seq: str, ref_seq: str):
+    """
+    Compare answer_sequence (from LLM) vs ref_seq (from structure).
+    Logs samples where both have valid (non-X) positions but differ.
+    
+    Legend:
+      = : Both valid & same (match)
+      * : Both valid but DIFFERENT (mismatch)
+      r : Only ref valid (answer has X)
+      a : Only answer valid (ref has X)
+    """
+    global _SEQ_COMPARE_LOG_FILE, _SEQ_COMPARE_COUNT
+    
+    if not answer_seq or not ref_seq:
+        return
+    
+    min_len = min(len(answer_seq), len(ref_seq))
+    if min_len == 0:
+        return
+    
+    # Build diff line and count mismatches
+    diff = []
+    n_match = 0
+    n_mismatch = 0
+    n_ans_mask = 0
+    n_ref_mask = 0
+    
+    for i in range(min_len):
+        ans_char = answer_seq[i].upper()
+        ref_char = ref_seq[i].upper()
+        ans_valid = ans_char != 'X'
+        ref_valid = ref_char != 'X'
+        
+        if ans_valid and ref_valid:
+            if ans_char == ref_char:
+                diff.append('=')
+                n_match += 1
+            else:
+                diff.append('*')
+                n_mismatch += 1
+        elif ans_valid and not ref_valid:
+            diff.append('a')
+        elif not ans_valid and ref_valid:
+            diff.append('r')
+            n_ans_mask += 1
+        else:
+            diff.append('.')
+    
+    diff_str = ''.join(diff)
+    
+    # Only log if there are mismatches (both valid but different)
+    if n_mismatch > 0 and _SEQ_COMPARE_COUNT < _SEQ_COMPARE_MAX_LOGS:
+        if _SEQ_COMPARE_LOG_FILE is None:
+            logs_dir = Path("./logs")
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            _SEQ_COMPARE_LOG_FILE = logs_dir / f"answer_vs_ref_mismatches_{timestamp}.log"
+            with open(_SEQ_COMPARE_LOG_FILE, 'w') as f:
+                f.write("# answer_sequence vs ref_seq mismatches\n")
+                f.write("# Legend: = (match), * (MISMATCH), r (answer=X), a (ref=X), . (both=X)\n")
+                f.write("="*80 + "\n")
+        
+        with open(_SEQ_COMPARE_LOG_FILE, 'a') as f:
+            f.write(f"\n[{_SEQ_COMPARE_COUNT+1}] {sample_id}\n")
+            f.write(f"  answer: {answer_seq}\n")
+            f.write(f"  ref:    {ref_seq}\n")
+            f.write(f"  diff:   {diff_str}\n")
+            f.write(f"  >> {n_match} match, {n_mismatch} MISMATCH, {n_ans_mask} masked\n")
+        
+        _SEQ_COMPARE_COUNT += 1
+        
+        # Also print to console for immediate visibility (first few only)
+        if _SEQ_COMPARE_COUNT <= 5:
+            print(f"\n⚠️ answer_seq vs ref_seq MISMATCH [{sample_id}]:")
+            print(f"   answer: {answer_seq}")
+            print(f"   ref:    {ref_seq}")
+            print(f"   diff:   {diff_str}")
+            print(f"   >> {n_match} match, {n_mismatch} MISMATCH, {n_ans_mask} masked")
+
+
 from .bioparse import Block, Complex, VOCAB, const
 from .bioparse.utils import recur_index, index_to_numerical_index, is_aa
 
@@ -442,6 +528,11 @@ class BaseDataset(MMAPDataset):
                     answer_seq = extract_seq_from_structure(data['S'], data['generate_mask'])
                     if not answer_seq:
                         _log_invalid_seq(summary.id, "", None, "no_answer_sequence_in_jsonl")
+                
+                # DEBUG: Compare answer_sequence vs ref_seq (structure ground truth)
+                struct_seq = extract_seq_from_structure(data['S'], data['generate_mask'])
+                if struct_seq and answer_seq:
+                    _debug_compare_sequences(summary.id, answer_seq, struct_seq)
                 
                 # Apply random masking if configured
                 if answer_seq and self.gt_seq_mask_ratio > 0.0:

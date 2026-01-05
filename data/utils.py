@@ -166,40 +166,68 @@ def load_prompt_jsonl_extended_dual(
 
             _id = str(record[id_key]).strip()
 
-            # Extract prompt (question)
-            _prompt = record.get(prompt_key, "")
-            if _prompt:
-                prompt_map[_id] = _prompt
-                prompt_map[_id.lower()] = _prompt
-
             # Extract thinking and answer
             _thinking = record.get(thinking_key, "")
             _answer = record.get(response_key, "")
-
-            # Extract answer_sequence (clean CDR sequence from JSONL)
+            _prompt = record.get(prompt_key, "")
             _answer_sequence = record.get('answer_sequence', "")
+            _cdr_regions = record.get('cdr_region', [])
+
+            # Build keys - each record is CDR-specific so include CDR in key
+            # BUT also store with just base ID for backward compatibility with filtering
+            # (filtering uses raw mmap ID without CDR suffix)
+            keys_to_use = []
+            if _cdr_regions:
+                for _cdr in _cdr_regions:
+                    _full_key = f"{_id}/{_cdr}"
+                    keys_to_use.append(_full_key)
+            else:
+                # Fallback for records without cdr_region
+                keys_to_use.append(_id)
+            
+            # Store prompt with full key AND base ID for filtering compatibility
+            if _prompt:
+                for _key in keys_to_use:
+                    prompt_map[_key] = _prompt
+                    prompt_map[_key.lower()] = _prompt
+                # Also store with just base ID for filtering (mmap uses base IDs)
+                prompt_map[_id] = _prompt
+                prompt_map[_id.lower()] = _prompt
+
+            # Store answer_sequence with full key
             if _answer_sequence:
-                answer_sequence_map[_id] = _answer_sequence
-                answer_sequence_map[_id.lower()] = _answer_sequence
+                for _key in keys_to_use:
+                    answer_sequence_map[_key] = _answer_sequence
+                    answer_sequence_map[_key.lower()] = _answer_sequence
 
             if prevent_leakage_qkv_only:
                 # NEW MODE: Dual response versions
+                # All maps keyed by full sample_id including CDR type
+                # ALSO store with base ID for filtering compatibility
+                for _key in keys_to_use:
+                    raw_text_map[_key] = record
+                    raw_text_map[_key.lower()] = record
                 raw_text_map[_id] = record
                 raw_text_map[_id.lower()] = record
                 
                 if use_answer_only_qkv:
                     # DEBUG MODE: QKV uses only the answer text (no thinking, no foldability)
-                    # Purpose: Test if diffusion can learn using ground truth answer representation
                     if _answer:
+                        for _key in keys_to_use:
+                            response_qkv_map[_key] = _answer
+                            response_qkv_map[_key.lower()] = _answer
                         response_qkv_map[_id] = _answer
                         response_qkv_map[_id.lower()] = _answer
                 else:
                     # 1. QKV version: Truncated thinking (no answer leakage)
                     _thinking_truncated = _thinking
-                    if _thinking and leakage_marker in _thinking: #Erran: bug: the data uses "**5. Foldability:**"
+                    if _thinking and leakage_marker in _thinking:
                         _thinking_truncated = _thinking.split(leakage_marker)[0].strip()
                     
                     if _thinking_truncated:
+                        for _key in keys_to_use:
+                            response_qkv_map[_key] = _thinking_truncated
+                            response_qkv_map[_key.lower()] = _thinking_truncated
                         response_qkv_map[_id] = _thinking_truncated
                         response_qkv_map[_id.lower()] = _thinking_truncated
                 
@@ -212,6 +240,9 @@ def load_prompt_jsonl_extended_dual(
                 
                 if response_parts:
                     combined_response = "\n\n".join(response_parts)
+                    for _key in keys_to_use:
+                        response_sft_map[_key] = combined_response
+                        response_sft_map[_key.lower()] = combined_response
                     response_sft_map[_id] = combined_response
                     response_sft_map[_id.lower()] = combined_response
             else:

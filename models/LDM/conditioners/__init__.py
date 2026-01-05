@@ -11,17 +11,20 @@ Available conditioners:
 - QwenTextConditioner: Per-residue Qwen embeddings for conditioning
 - LearnedAAConditioner: Learned amino acid embeddings with position
 - ESMConditioner: ESM-2 protein language model embeddings
+- AnswerSeqConditioner: Hidden states from answer_sequence tokens (use_answer_seq_und)
 """
 
 from .base import BaseConditioner
 from .qwen_text import QwenTextConditioner
 from .learned_aa import LearnedAAConditioner
 from .esm import ESMConditioner
+from .answer_seq import AnswerSeqConditioner
 
 __all__ = [
     'BaseConditioner',
     'QwenTextConditioner', 
     'LearnedAAConditioner',
     'ESMConditioner',
+    'AnswerSeqConditioner',
 ]
 
