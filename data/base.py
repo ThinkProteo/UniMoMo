@@ -121,7 +121,7 @@ from .bioparse import Block, Complex, VOCAB, const
 from .bioparse.utils import recur_index, index_to_numerical_index, is_aa
 
 from .mmap_dataset import MMAPDataset
-from .utils import load_prompt_jsonl, load_prompt_jsonl_extended, load_prompt_jsonl_extended_dual
+from .utils import load_prompt_jsonl_extended_dual
 
 
 def extract_seq_from_structure(S: torch.Tensor, generate_mask: torch.Tensor) -> str:
@@ -257,7 +257,6 @@ class BaseDataset(MMAPDataset):
             specify_index: Optional[str] = None,
             prompt_jsonl: Optional[str] = None,
             strict_prompt: Optional[bool] = None,
-            use_extended_format: Optional[bool] = False,
             prevent_leakage: Optional[bool] = True,
             prevent_leakage_qkv_only: Optional[bool] = False,
             leakage_marker: Optional[str] = '**Foldability:**',
@@ -265,10 +264,10 @@ class BaseDataset(MMAPDataset):
             use_gt_seq: Optional[bool] = False,
             gt_seq_mask_ratio: Optional[float] = 0.0,
             use_answer_sequence: Optional[bool] = False,
+            use_extended_format: Optional[bool] = None,  # DEPRECATED: always True now, kept for config compat
         ) -> None:
         super().__init__(mmap_dir, specify_data, specify_index)
         self.mmap_dir = mmap_dir
-        self.use_extended_format = use_extended_format
         self.prevent_leakage = prevent_leakage
         self.prevent_leakage_qkv_only = prevent_leakage_qkv_only
         self.leakage_marker = leakage_marker
@@ -380,7 +379,7 @@ class BaseDataset(MMAPDataset):
         Filter out samples where prompts/responses are missing when strict_prompt=True.
         This method should be called by child classes after their initialization is complete.
         """
-        if not self.strict_prompt or not self.use_extended_format:
+        if not self.strict_prompt:
             # No filtering - use all indices
             self._original_length = len(self._properties)
             self._valid_indices = list(range(self._original_length))
@@ -493,7 +492,7 @@ class BaseDataset(MMAPDataset):
             'is_aa': [Nblock]
             'lengths': [1]
 
-            # Extended format fields (if use_extended_format=True):
+            # Extended format fields:
             'prompt_text': str,  # Question only
             'response_text': str,  # Thinking + Answer combined
             'prompt_tokens': [prompt_len],  # Character codes (replaced in collate)
@@ -508,87 +507,86 @@ class BaseDataset(MMAPDataset):
         data['center_mask'] = torch.tensor(summary.center_mask, dtype=torch.bool)
         data['sample_id'] = summary.id
 
-        if self.use_extended_format:
-            # Extended format: separate prompt and response
-            data['prompt_text'] = self._find_prompt(summary.id)
-            data['response_sft_text'] = self._find_response_sft(summary.id)
-            data['raw_text'] = self._find_raw_text(summary.id)
+        # Extended format: separate prompt and response
+        data['prompt_text'] = self._find_prompt(summary.id)
+        data['response_sft_text'] = self._find_response_sft(summary.id)
+        data['raw_text'] = self._find_raw_text(summary.id)
+        
+        # QKV conditioning: use ground truth sequence or response text
+        # NOTE: The collate_fn uses raw_text['thinking'] to build <think>...</think>
+        # QKV extraction happens on tokens within <think>...</think>
+        # So to override QKV content, we override raw_text['thinking']
+        if self.use_answer_sequence:
+            # Use answer_sequence from JSONL for conditioning
+            # This is cleaner than ref_seq - already extracted CDR sequence without gap markers
+            answer_seq = self._find_answer_sequence(summary.id)
             
-            # QKV conditioning: use ground truth sequence or response text
-            # NOTE: The collate_fn uses raw_text['thinking'] to build <think>...</think>
-            # QKV extraction happens on tokens within <think>...</think>
-            # So to override QKV content, we override raw_text['thinking']
-            if self.use_answer_sequence:
-                # Use answer_sequence from JSONL for conditioning
-                # This is cleaner than ref_seq - already extracted CDR sequence without gap markers
-                answer_seq = self._find_answer_sequence(summary.id)
-                
+            if not answer_seq:
+                # Fallback to structure-based extraction
+                answer_seq = extract_seq_from_structure(data['S'], data['generate_mask'])
                 if not answer_seq:
-                    # Fallback to structure-based extraction
-                    answer_seq = extract_seq_from_structure(data['S'], data['generate_mask'])
-                    if not answer_seq:
-                        _log_invalid_seq(summary.id, "", None, "no_answer_sequence_in_jsonl")
-                
-                # DEBUG: Compare answer_sequence vs ref_seq (structure ground truth)
-                struct_seq = extract_seq_from_structure(data['S'], data['generate_mask'])
-                if struct_seq and answer_seq:
-                    _debug_compare_sequences(summary.id, answer_seq, struct_seq)
-                
-                # Apply random masking if configured
-                if answer_seq and self.gt_seq_mask_ratio > 0.0:
-                    answer_seq = mask_sequence_randomly(answer_seq, self.gt_seq_mask_ratio)
-                
-                # Set data for downstream use
-                data['response_qkv_text'] = answer_seq if answer_seq else ""
-                data['gt_seq_for_injection'] = answer_seq if answer_seq else None
-                if data.get('raw_text'):
-                    data['raw_text'] = dict(data['raw_text'])  # Make a copy to avoid mutating cache
-                    data['raw_text']['thinking'] = answer_seq if answer_seq else ""
-                    data['raw_text']['question'] = ""  # No prompt - QKV tokens are standalone
-            elif self.use_gt_seq:
-                # Use ground truth CDR sequence for conditioning
-                # Priority 1: Extract from STRUCTURE data (S tensor) - most reliable
-                struct_seq = extract_seq_from_structure(data['S'], data['generate_mask'])
-                
-                if struct_seq:
-                    ref_seq = struct_seq
-                else:
-                    # Priority 2: Clean the metadata ref_seq (may contain gap markers)
-                    # Gap markers look like: 'f323f295f274f214' (fragment IDs in structural gaps)
-                    # Example: 'EGPRATGYSf274f214ADVFDI' -> 'EGPRATGYSXXADVFDI'
-                    ref_seq = clean_sequence_with_gaps(summary.ref_seq)
-                    
-                    if ref_seq != summary.ref_seq:
-                        # Log if we had to clean the sequence
-                        _log_invalid_seq(summary.id, summary.ref_seq, ref_seq, "gap_markers_replaced")
-                
-                if not ref_seq:
-                    _log_invalid_seq(summary.id, summary.ref_seq, None, "no_valid_sequence")
-                
-                # Apply random masking if configured
-                # This randomly replaces a fraction of residues with 'X' for training robustness
-                if ref_seq and self.gt_seq_mask_ratio > 0.0:
-                    ref_seq = mask_sequence_randomly(ref_seq, self.gt_seq_mask_ratio)
-                
-                # Always set these keys (even if empty) so collate_fn doesn't get KeyError
-                data['response_qkv_text'] = ref_seq if ref_seq else ""
-                data['gt_seq_for_injection'] = ref_seq if ref_seq else None
-                if data.get('raw_text'):
-                    data['raw_text'] = dict(data['raw_text'])  # Make a copy to avoid mutating cache
-                    data['raw_text']['thinking'] = ref_seq if ref_seq else ""  # Use clean sequence
-                    data['raw_text']['question'] = ""  # No prompt - QKV tokens are standalone
-            elif self.use_answer_only_qkv:
-                # DEBUG: Use answer text for QKV conditioning
-                # Override 'thinking' with answer so QKV extracts from answer tokens
-                # Also clear 'question' so QKV tokens don't attend to any prompt
-                answer_text = data.get('raw_text', {}).get('answer', '') if data.get('raw_text') else ''
-                data['response_qkv_text'] = answer_text
-                if data.get('raw_text'):
-                    data['raw_text'] = dict(data['raw_text'])  # Make a copy
-                    data['raw_text']['thinking'] = answer_text  # Answer becomes thinking content
-                    data['raw_text']['question'] = ""  # No prompt - QKV tokens are standalone
+                    _log_invalid_seq(summary.id, "", None, "no_answer_sequence_in_jsonl")
+            
+            # DEBUG: Compare answer_sequence vs ref_seq (structure ground truth)
+            struct_seq = extract_seq_from_structure(data['S'], data['generate_mask'])
+            if struct_seq and answer_seq:
+                _debug_compare_sequences(summary.id, answer_seq, struct_seq)
+            
+            # Apply random masking if configured
+            if answer_seq and self.gt_seq_mask_ratio > 0.0:
+                answer_seq = mask_sequence_randomly(answer_seq, self.gt_seq_mask_ratio)
+            
+            # Set data for downstream use
+            data['response_qkv_text'] = answer_seq if answer_seq else ""
+            data['gt_seq_for_injection'] = answer_seq if answer_seq else None
+            if data.get('raw_text'):
+                data['raw_text'] = dict(data['raw_text'])  # Make a copy to avoid mutating cache
+                data['raw_text']['thinking'] = answer_seq if answer_seq else ""
+                data['raw_text']['question'] = ""  # No prompt - QKV tokens are standalone
+        elif self.use_gt_seq:
+            # Use ground truth CDR sequence for conditioning
+            # Priority 1: Extract from STRUCTURE data (S tensor) - most reliable
+            struct_seq = extract_seq_from_structure(data['S'], data['generate_mask'])
+            
+            if struct_seq:
+                ref_seq = struct_seq
             else:
-                data['response_qkv_text'] = self._find_response_qkv(summary.id)
+                # Priority 2: Clean the metadata ref_seq (may contain gap markers)
+                # Gap markers look like: 'f323f295f274f214' (fragment IDs in structural gaps)
+                # Example: 'EGPRATGYSf274f214ADVFDI' -> 'EGPRATGYSXXADVFDI'
+                ref_seq = clean_sequence_with_gaps(summary.ref_seq)
+                
+                if ref_seq != summary.ref_seq:
+                    # Log if we had to clean the sequence
+                    _log_invalid_seq(summary.id, summary.ref_seq, ref_seq, "gap_markers_replaced")
+            
+            if not ref_seq:
+                _log_invalid_seq(summary.id, summary.ref_seq, None, "no_valid_sequence")
+            
+            # Apply random masking if configured
+            # This randomly replaces a fraction of residues with 'X' for training robustness
+            if ref_seq and self.gt_seq_mask_ratio > 0.0:
+                ref_seq = mask_sequence_randomly(ref_seq, self.gt_seq_mask_ratio)
+            
+            # Always set these keys (even if empty) so collate_fn doesn't get KeyError
+            data['response_qkv_text'] = ref_seq if ref_seq else ""
+            data['gt_seq_for_injection'] = ref_seq if ref_seq else None
+            if data.get('raw_text'):
+                data['raw_text'] = dict(data['raw_text'])  # Make a copy to avoid mutating cache
+                data['raw_text']['thinking'] = ref_seq if ref_seq else ""  # Use clean sequence
+                data['raw_text']['question'] = ""  # No prompt - QKV tokens are standalone
+        elif self.use_answer_only_qkv:
+            # DEBUG: Use answer text for QKV conditioning
+            # Override 'thinking' with answer so QKV extracts from answer tokens
+            # Also clear 'question' so QKV tokens don't attend to any prompt
+            answer_text = data.get('raw_text', {}).get('answer', '') if data.get('raw_text') else ''
+            data['response_qkv_text'] = answer_text
+            if data.get('raw_text'):
+                data['raw_text'] = dict(data['raw_text'])  # Make a copy
+                data['raw_text']['thinking'] = answer_text  # Answer becomes thinking content
+                data['raw_text']['question'] = ""  # No prompt - QKV tokens are standalone
+        else:
+            data['response_qkv_text'] = self._find_response_qkv(summary.id)
 
         # Always include ref_seq for potential use in inference/debugging
         data['ref_seq'] = summary.ref_seq

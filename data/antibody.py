@@ -24,7 +24,6 @@ class AntibodyDataset(BaseDataset):
             test_mode: bool = False, # extend all CDRs
             prompt_jsonl: Optional[str] = None,
             strict_prompt: Optional[bool] = None,
-            use_extended_format: bool = False,
             prevent_leakage: bool = False,
             prevent_leakage_qkv_only: bool = False,
             leakage_marker: str = '**Foldability:**',
@@ -32,8 +31,9 @@ class AntibodyDataset(BaseDataset):
             use_gt_seq: bool = False,
             gt_seq_mask_ratio: float = 0.0,
             use_answer_sequence: bool = False,
+            use_extended_format: bool = None,  # DEPRECATED: always True now, kept for config compat
         ) -> None:
-        super().__init__(mmap_dir, specify_data, specify_index, prompt_jsonl, strict_prompt, use_extended_format, prevent_leakage, prevent_leakage_qkv_only, leakage_marker, use_answer_only_qkv, use_gt_seq, gt_seq_mask_ratio, use_answer_sequence)
+        super().__init__(mmap_dir, specify_data, specify_index, prompt_jsonl, strict_prompt, prevent_leakage, prevent_leakage_qkv_only, leakage_marker, use_answer_only_qkv, use_gt_seq, gt_seq_mask_ratio, use_answer_sequence)
         self.mmap_dir = mmap_dir
         # self.resampler = ClusterResampler(cluster) if cluster else None  # should only be used in training!
         self.length_type = length_type
