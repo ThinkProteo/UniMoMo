@@ -103,7 +103,9 @@ class MMAPDataset(torch.utils.data.Dataset):
         return len(self._indexes)
 
     def __getitem__(self, idx: int):
-        if idx < 0 or idx >= len(self):
+        # Use len(self._indexes) instead of len(self) because child classes
+        # may override __len__ (e.g., AntibodyDataset returns len(idx_tup))
+        if idx < 0 or idx >= len(self._indexes):
             raise IndexError(idx)
         
         _, start, end = self._indexes[idx]

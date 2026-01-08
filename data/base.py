@@ -298,7 +298,6 @@ class BaseDataset(MMAPDataset):
         # default non-strict to avoid hard failures on missing ids
         self.strict_prompt = False if strict_prompt is None else strict_prompt
         self._missing_prompt_warned = False
-        self._cdr_suffix = {'HCDR1','HCDR2','HCDR3','LCDR1','LCDR2','LCDR3'}
         
         # Pre-filter samples with missing prompts/responses when strict_prompt=True
         self._valid_indices = None  # Will be set by child class after initialization
@@ -306,17 +305,20 @@ class BaseDataset(MMAPDataset):
 
     def _find(self, mapping: dict, sample_id: str):
         """
-        Generic lookup function with fuzzy matching.
+        Generic lookup function with exact matching (case-insensitive).
         
-        Tries multiple strategies:
+        IMPORTANT: Each sample is CDR-specific (e.g., 5kaq_B_H_L/LCDR2).
+        We do NOT strip CDR suffix because that would return data for a 
+        different CDR region!
+        
+        Tries:
         1. Exact match
         2. Case-insensitive match
-        3. Strip CDR suffix (e.g., 4fqv_BA_H_L/HCDR3 -> 4fqv_BA_H_L)
-        4. Trim trailing underscores
+        3. Trim trailing underscores (for minor formatting differences)
         
         Args:
             mapping: Dictionary to search in
-            sample_id: ID to look up
+            sample_id: ID to look up (may include CDR suffix like /HCDR3)
             
         Returns:
             Value from mapping or None if not found
@@ -332,22 +334,13 @@ class BaseDataset(MMAPDataset):
         if sid.lower() in mapping:
             return mapping[sid.lower()]
 
-        # Strip CDR suffix if present (e.g., 4fqv_BA_H_L/HCDR3 -> 4fqv_BA_H_L)
-        if '/' in sid:
-            base_id, suffix = sid.rsplit('/', 1)
-            if suffix in self._cdr_suffix:
-                if base_id in mapping:
-                    return mapping[base_id]
-                if base_id.lower() in mapping:
-                    return mapping[base_id.lower()]
-            sid = base_id
-
-        # Trim trailing underscores
+        # Trim trailing underscores (minor formatting difference, NOT CDR stripping)
         trimmed = sid.rstrip('_')
-        if trimmed in mapping:
-            return mapping[trimmed]
-        if trimmed.lower() in mapping:
-            return mapping[trimmed.lower()]
+        if trimmed != sid:  # Only try if we actually trimmed something
+            if trimmed in mapping:
+                return mapping[trimmed]
+            if trimmed.lower() in mapping:
+                return mapping[trimmed.lower()]
 
         return None
 
@@ -373,6 +366,25 @@ class BaseDataset(MMAPDataset):
     def _find_answer_sequence(self, sample_id: str):
         """Find answer_sequence (clean CDR sequence from JSONL) for a sample ID."""
         return self._find(self._answer_sequence_map, sample_id)
+
+    def _check_sample_data_exists(self, sample_id: str) -> bool:
+        """
+        Check if all required JSONL data exists for a sample ID.
+        Used by child classes for CDR-specific filtering.
+        """
+        if not self.strict_prompt:
+            return True  # No filtering needed
+        
+        prompt_exists = self._find_prompt(sample_id) is not None
+        raw_text_exists = self._find_raw_text(sample_id) is not None
+        
+        if self.prevent_leakage_qkv_only:
+            response_qkv_exists = self._find_response_qkv(sample_id) is not None
+            response_sft_exists = self._find_response_sft(sample_id) is not None
+            return prompt_exists and response_qkv_exists and response_sft_exists and raw_text_exists
+        else:
+            response_exists = self._find_response(sample_id) is not None
+            return prompt_exists and response_exists and raw_text_exists
 
     def _filter_samples_by_prompt_availability(self):
         """
@@ -407,12 +419,14 @@ class BaseDataset(MMAPDataset):
             
             # Check if data exists
             prompt_exists = self._find_prompt(sample_id) is not None
+            raw_text_exists = self._find_raw_text(sample_id) is not None
             
             if self.prevent_leakage_qkv_only:
-                # Dual mode: check both QKV and SFT responses
+                # Dual mode: check both QKV and SFT responses, plus raw_text
                 response_qkv_exists = self._find_response_qkv(sample_id) is not None
                 response_sft_exists = self._find_response_sft(sample_id) is not None
-                data_complete = prompt_exists and response_qkv_exists and response_sft_exists
+                # CRITICAL: Also check raw_text - needed for answer_sequence conditioning
+                data_complete = prompt_exists and response_qkv_exists and response_sft_exists and raw_text_exists
                 
                 # Track what's missing for logging
                 if not data_complete and len(filtered_samples) < 5:
@@ -420,17 +434,20 @@ class BaseDataset(MMAPDataset):
                     if not prompt_exists: missing.append("prompt")
                     if not response_qkv_exists: missing.append("response_qkv")
                     if not response_sft_exists: missing.append("response_sft")
+                    if not raw_text_exists: missing.append("raw_text")
                     filtered_samples.append(f"{sample_id} (missing: {', '.join(missing)})")
             else:
-                # Standard mode: check single response
+                # Standard mode: check single response plus raw_text
                 response_exists = self._find_response(sample_id) is not None
-                data_complete = prompt_exists and response_exists
+                # CRITICAL: Also check raw_text - needed for answer_sequence conditioning
+                data_complete = prompt_exists and response_exists and raw_text_exists
                 
                 # Track what's missing for logging
                 if not data_complete and len(filtered_samples) < 5:
                     missing = []
                     if not prompt_exists: missing.append("prompt")
                     if not response_exists: missing.append("response")
+                    if not raw_text_exists: missing.append("raw_text")
                     filtered_samples.append(f"{sample_id} (missing: {', '.join(missing)})")
             
             if data_complete:

@@ -35,37 +35,69 @@ class AntibodyDataset(BaseDataset):
         ) -> None:
         super().__init__(mmap_dir, specify_data, specify_index, prompt_jsonl, strict_prompt, prevent_leakage, prevent_leakage_qkv_only, leakage_marker, use_answer_only_qkv, use_gt_seq, gt_seq_mask_ratio, use_answer_sequence)
         self.mmap_dir = mmap_dir
-        # self.resampler = ClusterResampler(cluster) if cluster else None  # should only be used in training!
         self.length_type = length_type
         self.test_mode = test_mode
-
-        # Apply filtering after parent initialization
-        # This will actually remove invalid samples from _indexes and _properties
-        self._filter_samples_by_prompt_availability()
-        
-        # Build idx_tup from the already-filtered _properties
-        # After filtering, _properties only contains valid samples
-        self.idx_tup = []
-        if test_mode:       
-            for idx, prop in enumerate(self._properties):
-                if 1 in prop['heavy_model_mark'] and 'HCDR1' in cdr_type: self.idx_tup.append((idx, 'HCDR1'))
-                if 2 in prop['heavy_model_mark'] and 'HCDR2' in cdr_type: self.idx_tup.append((idx, 'HCDR2'))
-                if 3 in prop['heavy_model_mark'] and 'HCDR3' in cdr_type: self.idx_tup.append((idx, 'HCDR3'))
-                if 1 in prop['light_model_mark'] and 'LCDR1' in cdr_type: self.idx_tup.append((idx, 'LCDR1'))
-                if 2 in prop['light_model_mark'] and 'LCDR2' in cdr_type: self.idx_tup.append((idx, 'LCDR2'))
-                if 3 in prop['light_model_mark'] and 'LCDR3' in cdr_type: self.idx_tup.append((idx, 'LCDR3'))
-        else:
-            for idx, prop in enumerate(self._properties):
-                flag = False
-                if 1 in prop['heavy_model_mark'] and 'HCDR1' in cdr_type: flag = True 
-                if 2 in prop['heavy_model_mark'] and 'HCDR2' in cdr_type: flag = True 
-                if 3 in prop['heavy_model_mark'] and 'HCDR3' in cdr_type: flag = True 
-                if 1 in prop['light_model_mark'] and 'LCDR1' in cdr_type: flag = True 
-                if 2 in prop['light_model_mark'] and 'LCDR2' in cdr_type: flag = True 
-                if 3 in prop['light_model_mark'] and 'LCDR3' in cdr_type: flag = True 
-                if flag: self.idx_tup.append((idx, None))
-
         self.cdr_type = cdr_type
+
+        # Build idx_tup with CDR-specific filtering
+        # For test_mode: check JSONL data exists for each specific CDR
+        # For train_mode: check at least one CDR has JSONL data
+        self.idx_tup = []
+        filtered_count = 0
+        filtered_examples = []
+        
+        for idx, prop in enumerate(self._properties):
+            base_id = self._indexes[idx][0]
+            
+            if test_mode:
+                # Test mode: create separate entry for each CDR with JSONL data
+                for i, cdr in [(1, 'HCDR1'), (2, 'HCDR2'), (3, 'HCDR3')]:
+                    if i in prop['heavy_model_mark'] and cdr in cdr_type:
+                        sample_id = f"{base_id}/{cdr}"
+                        if self._check_sample_data_exists(sample_id):
+                            self.idx_tup.append((idx, cdr))
+                        else:
+                            filtered_count += 1
+                            if len(filtered_examples) < 3:
+                                filtered_examples.append(sample_id)
+                                
+                for i, cdr in [(1, 'LCDR1'), (2, 'LCDR2'), (3, 'LCDR3')]:
+                    if i in prop['light_model_mark'] and cdr in cdr_type:
+                        sample_id = f"{base_id}/{cdr}"
+                        if self._check_sample_data_exists(sample_id):
+                            self.idx_tup.append((idx, cdr))
+                        else:
+                            filtered_count += 1
+                            if len(filtered_examples) < 3:
+                                filtered_examples.append(sample_id)
+            else:
+                # Train mode: check if ANY requested CDR has JSONL data for this complex
+                available_cdrs = []
+                for i, cdr in [(1, 'HCDR1'), (2, 'HCDR2'), (3, 'HCDR3')]:
+                    if i in prop['heavy_model_mark'] and cdr in cdr_type:
+                        sample_id = f"{base_id}/{cdr}"
+                        if self._check_sample_data_exists(sample_id):
+                            available_cdrs.append(cdr)
+                            
+                for i, cdr in [(1, 'LCDR1'), (2, 'LCDR2'), (3, 'LCDR3')]:
+                    if i in prop['light_model_mark'] and cdr in cdr_type:
+                        sample_id = f"{base_id}/{cdr}"
+                        if self._check_sample_data_exists(sample_id):
+                            available_cdrs.append(cdr)
+                
+                if available_cdrs:
+                    # Store available CDRs for random selection during training
+                    self.idx_tup.append((idx, None, available_cdrs))
+                else:
+                    filtered_count += 1
+                    if len(filtered_examples) < 3:
+                        filtered_examples.append(base_id)
+        
+        if filtered_count > 0:
+            total = len(self._properties) * (len(cdr_type) if test_mode else 1)
+            print(f"[INFO] CDR-level filtered {filtered_count} samples with missing JSONL data")
+            if filtered_examples:
+                print(f"[INFO] Example filtered CDRs: {', '.join(filtered_examples[:3])}")
 
     ########## Start of Overloading ##########
     def __len__(self):
@@ -81,23 +113,32 @@ class AntibodyDataset(BaseDataset):
             raise NotImplementedError(f'length type {self.length_type} not recognized')
 
     def get_raw_data(self, idx):
-        idx, _ = self.idx_tup[idx]
-        return super().get_raw_data(idx)
+        tup = self.idx_tup[idx]
+        struct_idx = tup[0]
+        return super().get_raw_data(struct_idx)
 
     def get_summary(self, idx: int): # when called from __getitem__, the index is already transformed
-        idx, cdr = self.idx_tup[idx]
-        props = self._properties[idx]
-        _id = self._indexes[idx][0]
+        tup = self.idx_tup[idx]
+        struct_idx = tup[0]
+        cdr = tup[1]  # None in train mode, specific CDR in test mode
+        available_cdrs = tup[2] if len(tup) > 2 else None  # Only in train mode
+        
+        props = self._properties[struct_idx]
+        _id = self._indexes[struct_idx][0]
 
         if cdr is None:
             assert not self.test_mode
-            # randomly sample one available CDR
-            choices = []
-            for i in range(1, 4):
-                if i in props['heavy_model_mark']: choices.append(f'HCDR{i}')
-            for i in range(1, 4):
-                if i in props['light_model_mark']: choices.append(f'LCDR{i}')
-            cdr = random.choice(list(set(choices).intersection(set(self.cdr_type))))
+            # Use pre-filtered available CDRs (already checked for JSONL data existence)
+            if available_cdrs:
+                cdr = random.choice(available_cdrs)
+            else:
+                # Fallback to old behavior if available_cdrs not set
+                choices = []
+                for i in range(1, 4):
+                    if i in props['heavy_model_mark']: choices.append(f'HCDR{i}')
+                for i in range(1, 4):
+                    if i in props['light_model_mark']: choices.append(f'LCDR{i}')
+                cdr = random.choice(list(set(choices).intersection(set(self.cdr_type))))
 
         # get indexes (pocket + peptide)
         epitope_block_ids = [(chain, tuple(block_id)) for chain, block_id in props['epitope_block_id']]
